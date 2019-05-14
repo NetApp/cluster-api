@@ -49,13 +49,24 @@ spec:
 
   stages {
 
-
-    stage('gazell'){
+    stage('gazelle'){
       steps {
         container('bazel') {
           dir('/home/jenkins/go/src/github.com/NetApp/cluster-api') {
             checkout scm
             sh('./hack/update-bazel.sh')
+          }
+        }
+      }
+    }
+
+    stage('verify'){
+      steps {
+        container('builder-base') {
+          dir('/home/jenkins/go/src/github.com/NetApp/cluster-api') {
+            sh("./hack/verify_boilerplate.py")
+            sh("./hack/verify_clientset.sh")
+            sh("./hack/verify-bazel.sh")
           }
         }
       }
