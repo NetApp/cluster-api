@@ -27,7 +27,7 @@ spec:
     command:
     - cat
   - name: bazel
-    image: insready/bazel
+    image: gcr.io/stackpoint-public/bazel:0.25.2
     tty: true
     command:
     - cat
