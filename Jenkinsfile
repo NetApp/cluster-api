@@ -155,7 +155,7 @@ spec:
       steps {
         container('builder-base') {
           script {
-            docker.withRegistry("https:/$DOCKER_REGISTRY", "gcr:$ORG") {
+            docker.withRegistry("https://$DOCKER_REGISTRY", "gcr:$ORG") {
               image.push("netapp-$GIT_COMMIT_SHORT")
             }
           }
