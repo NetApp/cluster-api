@@ -93,18 +93,26 @@ spec:
     }
 
     stage('generate'){
-      steps {
-        container('golang') {
-          dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
-            sh('go generate ./pkg/... ./cmd/...')
+      stages {
+        stage('go'){
+          steps {
+            container('golang') {
+              dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
+                sh('go generate ./pkg/... ./cmd/...')
+              }
+            }
           }
         }
-      }
-      container('bazel') {
-        dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
-          checkout scm
-          sh('./hack/update-bazel.sh')
-        }
+       stage('gazelle'){
+            steps {
+              container('bazel') {
+                dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
+                    checkout scm
+                    sh('./hack/update-bazel.sh')
+                }
+              }
+            }
+          }
       }
     }
 
