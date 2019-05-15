@@ -52,7 +52,7 @@ spec:
     stage('gazelle'){
       steps {
         container('bazel') {
-          dir('/home/jenkins/go/src/sigs.k8s.io//cluster-api') {
+          dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
             checkout scm
             sh('./hack/update-bazel.sh')
           }
@@ -64,7 +64,7 @@ spec:
         stage('verify_boilerplate'){
           steps {
             container('builder-base') {
-              dir('/home/jenkins/go/src/sigs.k8s.io//cluster-api') {
+              dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
                 sh("./hack/verify_boilerplate.py")
               }
             }
@@ -73,7 +73,7 @@ spec:
         stage('verify_clientset'){
           steps {
             container('golang') {
-              dir('/home/jenkins/go/src/sigs.k8s.io//cluster-api') {
+              dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
                 sh("./hack/verify_clientset.sh")
               }
             }
@@ -83,7 +83,7 @@ spec:
         stage('verify-bazel'){
           steps {
             container('bazel') {
-              dir('/home/jenkins/go/src/sigs.k8s.io//cluster-api') {
+              dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
                 sh(script: "./hack/verify-bazel.sh", returnStatus: true)
               }
             }
@@ -95,10 +95,15 @@ spec:
     stage('generate'){
       steps {
         container('golang') {
-          dir('/home/jenkins/go/src/sigs.k8s.io//cluster-api') {
-            checkout scm
+          dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
             sh('go generate ./pkg/... ./cmd/...')
           }
+        }
+      }
+      container('bazel') {
+        dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
+          checkout scm
+          sh('./hack/update-bazel.sh')
         }
       }
     }
@@ -106,7 +111,7 @@ spec:
     stage('manifests'){
       steps {
         container('golang') {
-          dir('/home/jenkins/go/src/sigs.k8s.io//cluster-api') {
+          dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
             sh('go run vendor/sigs.k8s.io/controller-tools/cmd/controller-gen/main.go all')
           }
         }
@@ -133,7 +138,7 @@ spec:
       steps {
         container('builder-base') {
           script {
-            docker.withRegistry("https://$DOCKER_REGISTRY", "gcr:$ORG") {
+            docker.withRegistry("https:/$DOCKER_REGISTRY", "gcr:$ORG") {
               image.push("netapp-$GIT_COMMIT_SHORT")
             }
           }
