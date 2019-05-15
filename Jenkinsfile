@@ -49,11 +49,21 @@ spec:
 
   stages {
 
+    stage('checkout'){
+      steps {
+        container('builder-base') {
+          dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
+            checkout scm
+          }
+        }
+      }
+    }
+
+
     stage('gazelle'){
       steps {
         container('bazel') {
           dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
-            checkout scm
             sh('./hack/update-bazel.sh')
           }
         }
@@ -107,7 +117,6 @@ spec:
             steps {
               container('bazel') {
                 dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
-                    checkout scm
                     sh('./hack/update-bazel.sh')
                 }
               }
