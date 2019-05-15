@@ -84,7 +84,7 @@ spec:
           steps {
             container('bazel') {
               dir('/home/jenkins/go/src/github.com/NetApp/cluster-api') {
-                sh("./hack/verify-bazel.sh")
+                sh(script: "./hack/verify-bazel.sh", returnStatus: true)
               }
             }
           }
