@@ -145,7 +145,31 @@ spec:
       }
     }
 
-    stage('publish') {
+    stage('publish: dev') {
+      when {
+        branch 'PR-*'
+      }
+      environment {
+        GIT_COMMIT_SHORT = sh(
+                script: "printf \$(git rev-parse --short ${GIT_COMMIT})",
+                returnStdout: true
+        ).trim()
+      }
+      steps {
+        container('builder-base') {
+          script {
+            docker.withRegistry("https://$DOCKER_REGISTRY", "gcr:$ORG") {
+              image.push("netapp-dev-$GIT_COMMIT_SHORT")
+            }
+          }
+        }
+      }
+    }
+
+    stage('publish: netapp') {
+      when {
+        branch 'netapp'
+      }
       environment {
         GIT_COMMIT_SHORT = sh(
                 script: "printf \$(git rev-parse --short ${GIT_COMMIT})",
