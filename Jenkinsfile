@@ -75,7 +75,7 @@ spec:
           steps {
             container('builder-base') {
               dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
-                sh("./hack/verify_boilerplate.py")
+                sh("./hack/verify-boilerplate.py")
               }
             }
           }
@@ -84,7 +84,7 @@ spec:
           steps {
             container('golang') {
               dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
-                sh("./hack/verify_clientset.sh")
+                sh("./hack/verify-clientset.sh")
               }
             }
           }
