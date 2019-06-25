@@ -71,16 +71,16 @@ spec:
     }
     stage('verify'){
       parallel {
-        stage('verify_boilerplate'){
+        stage('verify-boilerplate'){
           steps {
             container('builder-base') {
               dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
-                sh("./hack/verify-boilerplate.py")
+                sh("./hack/verify-boilerplate.sh")
               }
             }
           }
         }
-        stage('verify_clientset'){
+        stage('verify-clientset'){
           steps {
             container('golang') {
               dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
