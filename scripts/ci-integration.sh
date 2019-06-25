@@ -19,9 +19,9 @@ set -o nounset
 set -o pipefail
 
 MAKE="make"
-KIND_VERSION="0.2.1"
+KIND_VERSION="v0.3.0"
 KUSTOMIZE_VERSION="2.0.3"
-KUBECTL_VERSION="v1.13.2"
+KUBECTL_VERSION="v1.14.1"
 CRD_YAML="crd.yaml"
 BOOTSTRAP_CLUSTER_NAME="clusterapi-bootstrap"
 CONTROLLER_REPO="controller-ci" # use arbitrary repo name since we don't need to publish it
@@ -54,8 +54,8 @@ build_containers() {
    export CONTROLLER_IMG="${CONTROLLER_REPO}"
    export EXAMPLE_PROVIDER_IMG="${EXAMPLE_PROVIDER_REPO}"
 
-   "${MAKE}" docker-build TAG=${VERSION} ARCH=${GOARCH}
-   "${MAKE}" docker-build-ci TAG=${VERSION} ARCH=${GOARCH}
+   "${MAKE}" docker-build TAG="${VERSION}" ARCH="${GOARCH}"
+   "${MAKE}" docker-build-ci TAG="${VERSION}" ARCH="${GOARCH}"
 }
 
 prepare_crd_yaml() {
@@ -85,7 +85,7 @@ wait_pod_running() {
    do
       sleep ${INTERVAL};
       retry=$((retry - 1))
-      if [ $retry -lt 0 ];
+      if [[ $retry -lt 0 ]];
       then
          kubectl describe pod "$1" -n "$2"
          kubectl logs "$1" -n "$2"
@@ -96,7 +96,7 @@ wait_pod_running() {
 }
 
 ensure_docker_in_docker() {
-   if [ -z "${PROW_JOB_ID}" ] ; then
+   if [[ -z "${PROW_JOB_ID}" ]] ; then
       # start docker service in setup other than Prow
       service docker start
    fi
@@ -121,7 +121,7 @@ main() {
    wait_pod_running "provider-controller-manager-0" "provider-system"
    set -e
 
-   if [ -d "${INTEGRATION_TEST_DIR}" ] ; then
+   if [[ -d "${INTEGRATION_TEST_DIR}" ]] ; then
       go test -v "${INTEGRATION_TEST_DIR}"/...
    fi
 

@@ -37,7 +37,7 @@ const (
 /// [Machine]
 // Machine is the Schema for the machines API
 // +k8s:openapi-gen=true
-// +kubebuilder:resource:shortName=ma
+// +kubebuilder:resource:path=machines,shortName=ma
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="ProviderID",type="string",JSONPath=".spec.providerID",description="Provider ID"
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase",description="Machine status such as Terminating/Pending/Running/Failed etc"
@@ -59,7 +59,7 @@ type MachineSpec struct {
 	// indicate what labels, annotations, name prefix, etc., should be used
 	// when creating the Node.
 	// +optional
-	metav1.ObjectMeta `json:"metadata,omitempty"`
+	ObjectMeta `json:"metadata,omitempty"`
 
 	// The list of the taints to be applied to the corresponding Node in additive
 	// manner. This list will not overwrite any other taints added to the Node on
