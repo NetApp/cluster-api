@@ -129,7 +129,7 @@ spec:
       steps {
         container('golang') {
           dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
-            sh('go run vendor/sigs.k8s.io/controller-tools/cmd/controller-gen/main.go all')
+            sh('go run vendor/sigs.k8s.io/controller-tools/cmd/controller-gen/main.go paths=./pkg/... crd:trivialVersions=true rbac:roleName=manager-role output:crd:dir=./config/crds')
           }
         }
       }
