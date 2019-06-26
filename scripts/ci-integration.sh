@@ -28,9 +28,6 @@ CONTROLLER_REPO="controller-ci" # use arbitrary repo name since we don't need to
 EXAMPLE_PROVIDER_REPO="example-provider-ci"
 INTEGRATION_TEST_DIR="./test/integration"
 
-GOOS=$(go env GOOS)
-GOARCH=$(go env GOARCH)
-
 install_kustomize() {
    wget "https://github.com/kubernetes-sigs/kustomize/releases/download/v${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_${GOOS}_${GOARCH}" \
      --no-verbose -O /usr/local/bin/kustomize
@@ -51,11 +48,13 @@ install_kubectl() {
 
 build_containers() {
    VERSION="$(git describe --exact-match 2> /dev/null || git describe --match="$(git rev-parse --short=8 HEAD)" --always --dirty --abbrev=8)"
-   export CONTROLLER_IMG="${CONTROLLER_REPO}"
-   export EXAMPLE_PROVIDER_IMG="${EXAMPLE_PROVIDER_REPO}"
+   CONTROLLER_IMG="${CONTROLLER_REPO}:${VERSION}"
+   EXAMPLE_PROVIDER_IMG="${EXAMPLE_PROVIDER_REPO}:${VERSION}"
+   export CONTROLLER_IMG="${CONTROLLER_IMG}"
+   export EXAMPLE_PROVIDER_IMG="${EXAMPLE_PROVIDER_IMG}" 
 
-   "${MAKE}" docker-build TAG=${VERSION} ARCH=${GOARCH}
-   "${MAKE}" docker-build-ci TAG=${VERSION} ARCH=${GOARCH}
+   "${MAKE}" docker-build
+   "${MAKE}" docker-build-ci
 }
 
 prepare_crd_yaml() {
@@ -70,8 +69,8 @@ create_bootstrap() {
    KUBECONFIG="$(kind get kubeconfig-path --name="${BOOTSTRAP_CLUSTER_NAME}")"
    export KUBECONFIG
 
-   kind load docker-image "${CONTROLLER_IMG}-${GOARCH}:${VERSION}" --name "${BOOTSTRAP_CLUSTER_NAME}"
-   kind load docker-image "${EXAMPLE_PROVIDER_IMG}-${GOARCH}:${VERSION}" --name "${BOOTSTRAP_CLUSTER_NAME}"
+   kind load docker-image "${CONTROLLER_IMG}" --name "${BOOTSTRAP_CLUSTER_NAME}"
+   kind load docker-image "${EXAMPLE_PROVIDER_IMG}" --name "${BOOTSTRAP_CLUSTER_NAME}"
 }
 
 delete_bootstrap() {
