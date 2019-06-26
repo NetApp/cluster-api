@@ -28,6 +28,9 @@ CONTROLLER_REPO="controller-ci" # use arbitrary repo name since we don't need to
 EXAMPLE_PROVIDER_REPO="example-provider-ci"
 INTEGRATION_TEST_DIR="./test/integration"
 
+GOOS=$(go env GOOS)
+GOARCH=$(go env GOARCH)
+
 install_kustomize() {
    wget "https://github.com/kubernetes-sigs/kustomize/releases/download/v${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_${GOOS}_${GOARCH}" \
      --no-verbose -O /usr/local/bin/kustomize
@@ -48,10 +51,8 @@ install_kubectl() {
 
 build_containers() {
    VERSION="$(git describe --exact-match 2> /dev/null || git describe --match="$(git rev-parse --short=8 HEAD)" --always --dirty --abbrev=8)"
-   CONTROLLER_IMG="${CONTROLLER_REPO}:${VERSION}"
-   EXAMPLE_PROVIDER_IMG="${EXAMPLE_PROVIDER_REPO}:${VERSION}"
-   export CONTROLLER_IMG="${CONTROLLER_IMG}"
-   export EXAMPLE_PROVIDER_IMG="${EXAMPLE_PROVIDER_IMG}" 
+   export CONTROLLER_IMG="${CONTROLLER_REPO}:${VERSION}"
+   export EXAMPLE_PROVIDER_IMG="${EXAMPLE_PROVIDER_REPO}:${VERSION}"
 
    "${MAKE}" docker-build
    "${MAKE}" docker-build-ci
@@ -95,7 +96,7 @@ wait_pod_running() {
 }
 
 ensure_docker_in_docker() {
-   if [ -z "${PROW_JOB_ID}" ] ; then
+   if [ -z "${PROW_JOB_ID:-}" ] ; then
       # start docker service in setup other than Prow
       service docker start
    fi
