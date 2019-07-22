@@ -44,7 +44,7 @@ pipeline {
           steps {
             container('builder-base') {
               dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
-                sh("./hack/verify-boilerplate.py")
+                sh("./hack/verify-boilerplate.sh")
               }
             }
           }
