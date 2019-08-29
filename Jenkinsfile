@@ -13,7 +13,7 @@ pipeline {
     APP_NAME   = 'cluster-api'
     REPOSITORY = "${ORG}/${APP_NAME}"
     GO111MODULE = 'off'
-    GOPATH = '/home/jenkins/agent/go'
+    GOPATH = "${WORKSPACE}/go"
   }
 
   stages {
