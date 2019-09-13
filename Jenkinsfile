@@ -13,7 +13,7 @@ pipeline {
     APP_NAME   = 'cluster-api'
     REPOSITORY = "${ORG}/${APP_NAME}"
     GO111MODULE = 'off'
-    GOPATH = '/home/jenkins/go'
+    GOPATH = "${WORKSPACE}/go"
   }
 
   stages {
@@ -21,7 +21,7 @@ pipeline {
     stage('checkout'){
       steps {
         container('builder-base') {
-          dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
+          dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
             checkout scm
           }
         }
@@ -31,7 +31,7 @@ pipeline {
     stage('gazelle'){
       steps {
         container('bazel') {
-          dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
+          dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
             sh('./hack/update-bazel.sh')
           }
         }
@@ -43,7 +43,7 @@ pipeline {
         stage('verify-boilerplate'){
           steps {
             container('builder-base') {
-              dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
+              dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
                 sh("./hack/verify-boilerplate.sh")
               }
             }
@@ -52,7 +52,7 @@ pipeline {
         stage('verify_clientset'){
           steps {
             container('golang') {
-              dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
+              dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
                 sh("./hack/verify_clientset.sh")
               }
             }
@@ -61,7 +61,7 @@ pipeline {
         stage('verify-bazel'){
           steps {
             container('bazel') {
-              dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
+              dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
                 sh(script: "./hack/verify-bazel.sh", returnStatus: true)
               }
             }
@@ -75,7 +75,7 @@ pipeline {
         stage('go'){
           steps {
             container('golang') {
-              dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
+              dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
                 sh('go generate ./pkg/... ./cmd/...')
               }
             }
@@ -84,7 +84,7 @@ pipeline {
        stage('gazelle'){
             steps {
               container('bazel') {
-                dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
+                dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
                     sh('./hack/update-bazel.sh')
                 }
               }
@@ -96,7 +96,7 @@ pipeline {
     stage('manifests'){
       steps {
         container('golang') {
-          dir('/home/jenkins/go/src/sigs.k8s.io/cluster-api') {
+          dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
             sh('go run vendor/sigs.k8s.io/controller-tools/cmd/controller-gen/main.go all')
           }
         }
