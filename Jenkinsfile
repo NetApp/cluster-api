@@ -28,6 +28,7 @@ pipeline {
       }
     }
 
+    /*
     stage('gazelle'){
       steps {
         container('bazel') {
@@ -45,24 +46,6 @@ pipeline {
             container('builder-base') {
               dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
                 sh("./hack/verify-boilerplate.sh")
-              }
-            }
-          }
-        }
-        stage('verify_clientset'){
-          steps {
-            container('golang') {
-              dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
-                sh("./hack/verify_clientset.sh")
-              }
-            }
-          }
-        }
-        stage('verify-bazel'){
-          steps {
-            container('bazel') {
-              dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
-                sh(script: "./hack/verify-bazel.sh", returnStatus: true)
               }
             }
           }
@@ -101,7 +84,7 @@ pipeline {
           }
         }
       }
-    }
+    }*/
 
     stage('build') {
       steps {
