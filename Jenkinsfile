@@ -28,64 +28,6 @@ pipeline {
       }
     }
 
-    /*
-    stage('gazelle'){
-      steps {
-        container('bazel') {
-          dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
-            sh('./hack/update-bazel.sh')
-          }
-        }
-      }
-    }
-
-    stage('verify'){
-      parallel {
-        stage('verify-boilerplate'){
-          steps {
-            container('builder-base') {
-              dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
-                sh("./hack/verify-boilerplate.sh")
-              }
-            }
-          }
-        }
-      }
-    }
-
-    stage('generate'){
-      stages {
-        stage('go'){
-          steps {
-            container('golang') {
-              dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
-                sh('go generate ./pkg/... ./cmd/...')
-              }
-            }
-          }
-        }
-       stage('gazelle'){
-            steps {
-              container('bazel') {
-                dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
-                    sh('./hack/update-bazel.sh')
-                }
-              }
-            }
-          }
-      }
-    }
-
-    stage('manifests'){
-      steps {
-        container('golang') {
-          dir("${GOPATH}/src/sigs.k8s.io/cluster-api") {
-            sh('go run vendor/sigs.k8s.io/controller-tools/cmd/controller-gen/main.go all')
-          }
-        }
-      }
-    }*/
-
     stage('build') {
       steps {
         container('builder-base') {
