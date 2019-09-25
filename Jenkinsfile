@@ -40,10 +40,7 @@ pipeline {
 
     stage('publish: dev') {
       when {
-        anyOf {
-            branch 'PR-*'
-            branch 'netapp-*'
-        }
+        branch 'PR-*'
       }
       environment {
         GIT_COMMIT_SHORT = sh(
