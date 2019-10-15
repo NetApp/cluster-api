@@ -25,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
 )
 
@@ -310,9 +311,7 @@ func (s *sourcer) GetClusters(ns string) ([]*clusterv1.Cluster, error) {
 	if ns == "" {
 		out := []*clusterv1.Cluster{}
 		for _, clusters := range s.clusters {
-			for _, cluster := range clusters {
-				out = append(out, cluster)
-			}
+			out = append(out, clusters...)
 		}
 		return out, nil
 	}
@@ -324,9 +323,7 @@ func (s *sourcer) GetMachineDeployments(ns string) ([]*clusterv1.MachineDeployme
 	if ns == "" {
 		out := []*clusterv1.MachineDeployment{}
 		for _, mds := range s.machineDeployments {
-			for _, md := range mds {
-				out = append(out, md)
-			}
+			out = append(out, mds...)
 		}
 		return out, nil
 	}
@@ -348,9 +345,7 @@ func (s *sourcer) GetMachines(ns string) ([]*clusterv1.Machine, error) {
 	if ns == "" {
 		out := []*clusterv1.Machine{}
 		for _, machines := range s.machines {
-			for _, m := range machines {
-				out = append(out, m)
-			}
+			out = append(out, machines...)
 		}
 		return out, nil
 	}
@@ -362,9 +357,7 @@ func (s *sourcer) GetMachineSets(ns string) ([]*clusterv1.MachineSet, error) {
 	if ns == "" {
 		out := []*clusterv1.MachineSet{}
 		for _, machineSets := range s.machineSets {
-			for _, ms := range machineSets {
-				out = append(out, ms)
-			}
+			out = append(out, machineSets...)
 		}
 		return out, nil
 	}
@@ -564,6 +557,10 @@ func (t *target) EnsureNamespace(string) error {
 	return nil
 }
 
+func (t *target) GetCluster(name, ns string) (*clusterv1.Cluster, error) {
+	return nil, nil
+}
+
 func (t *target) GetMachineDeployment(ns, name string) (*clusterv1.MachineDeployment, error) {
 	for _, deployment := range t.machineDeployments[ns] {
 		if deployment.Name == name {
@@ -583,6 +580,10 @@ func (t *target) GetMachineSet(ns, name string) (*clusterv1.MachineSet, error) {
 }
 
 func (t *target) WaitForClusterV1alpha2Ready() error {
+	return nil
+}
+
+func (t *target) SetClusterOwnerRef(obj runtime.Object, cluster *clusterv1.Cluster) error {
 	return nil
 }
 

@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
@@ -27,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
@@ -149,7 +151,6 @@ func (r *MachineReconciler) reconcile(ctx context.Context, cluster *clusterv1.Cl
 		r.reconcileBootstrap(ctx, m),
 		r.reconcileInfrastructure(ctx, m),
 		r.reconcileNodeRef(ctx, cluster, m),
-		r.reconcileClusterStatus(ctx, cluster, m),
 	}
 
 	// Parse the errors, making sure we record if there is a RequeueAfterError.
@@ -184,9 +185,18 @@ func (r *MachineReconciler) reconcileDelete(ctx context.Context, cluster *cluste
 		}
 	} else {
 		klog.Infof("Deleting node %q for machine %q", m.Status.NodeRef.Name, m.Name)
-		if err := r.deleteNode(ctx, cluster, m.Status.NodeRef.Name); err != nil && !apierrors.IsNotFound(err) {
-			klog.Errorf("Error deleting node %q for machine %q: %v", m.Status.NodeRef.Name, m.Name, err)
-			return ctrl.Result{}, err
+
+		var deleteNodeErr error
+		waitErr := wait.PollImmediate(2*time.Second, 10*time.Second, func() (bool, error) {
+			if deleteNodeErr = r.deleteNode(ctx, cluster, m.Status.NodeRef.Name); deleteNodeErr != nil && !apierrors.IsNotFound(deleteNodeErr) {
+				return false, nil
+			}
+			return true, nil
+		})
+		if waitErr != nil {
+			// TODO: remove m.Name after #1203
+			r.Log.Error(deleteNodeErr, "timed out deleting Machine's node, moving on", "node", m.Status.NodeRef.Name, "machine", m.Name)
+			r.recorder.Eventf(m, corev1.EventTypeWarning, "FailedDeleteNode", "error deleting Machine's node: %v", deleteNodeErr)
 		}
 	}
 
@@ -209,7 +219,7 @@ func (r *MachineReconciler) isDeleteNodeAllowed(ctx context.Context, machine *cl
 	}
 
 	// Get all of the machines that belong to this cluster.
-	machines, err := r.getMachinesInCluster(ctx, machine.Namespace, machine.Labels[clusterv1.MachineClusterLabelName])
+	machines, err := getActiveMachinesInCluster(ctx, r.Client, machine.Namespace, machine.Labels[clusterv1.MachineClusterLabelName])
 	if err != nil {
 		return err
 	}
@@ -258,30 +268,6 @@ func (r *MachineReconciler) deleteNode(ctx context.Context, cluster *clusterv1.C
 	}
 
 	return corev1Remote.Nodes().Delete(name, &metav1.DeleteOptions{})
-}
-
-// getMachinesInCluster returns all of the Machine objects that belong to the
-// same cluster as the provided Machine
-func (r *MachineReconciler) getMachinesInCluster(ctx context.Context, namespace, name string) ([]*clusterv1.Machine, error) {
-	if name == "" {
-		return nil, nil
-	}
-
-	machineList := &clusterv1.MachineList{}
-	labels := map[string]string{clusterv1.MachineClusterLabelName: name}
-
-	if err := r.Client.List(ctx, machineList, client.InNamespace(namespace), client.MatchingLabels(labels)); err != nil {
-		return nil, errors.Wrap(err, "failed to list machines")
-	}
-
-	machines := []*clusterv1.Machine{}
-	for i := range machineList.Items {
-		m := &machineList.Items[i]
-		if m.DeletionTimestamp.IsZero() {
-			machines = append(machines, m)
-		}
-	}
-	return machines, nil
 }
 
 // reconcileDeleteExternal tries to delete external references, returning true if it cannot find any.

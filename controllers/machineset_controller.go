@@ -320,7 +320,6 @@ func (r *MachineSetReconciler) syncReplicas(ms *clusterv1.MachineSet, machines [
 		// Choose which Machines to delete.
 		machinesToDelete := getMachinesToDeletePrioritized(machines, diff, deletePriorityFunc)
 
-		// TODO: Add cap to limit concurrent delete calls.
 		errCh := make(chan error, diff)
 		var wg sync.WaitGroup
 		wg.Add(diff)
@@ -386,9 +385,10 @@ func shouldExcludeMachine(machineSet *clusterv1.MachineSet, machine *clusterv1.M
 
 // adoptOrphan sets the MachineSet as a controller OwnerReference to the Machine.
 func (r *MachineSetReconciler) adoptOrphan(machineSet *clusterv1.MachineSet, machine *clusterv1.Machine) error {
+	patch := client.MergeFrom(machine.DeepCopy())
 	newRef := *metav1.NewControllerRef(machineSet, machineSetKind)
 	machine.OwnerReferences = append(machine.OwnerReferences, newRef)
-	return r.Client.Update(context.Background(), machine)
+	return r.Client.Patch(context.Background(), machine, patch)
 }
 
 func (r *MachineSetReconciler) waitForMachineCreation(machineList []*clusterv1.Machine) error {

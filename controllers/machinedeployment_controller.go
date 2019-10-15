@@ -106,6 +106,8 @@ func (r *MachineDeploymentReconciler) Reconcile(req ctrl.Request) (ctrl.Result, 
 func (r *MachineDeploymentReconciler) reconcile(ctx context.Context, d *clusterv1.MachineDeployment) (ctrl.Result, error) {
 	clusterv1.PopulateDefaultsMachineDeployment(d)
 
+	// Test for an empty LabelSelector and short circuit if that is the case
+	// TODO: When we have validation webhooks, we should likely reject on an empty LabelSelector
 	everything := metav1.LabelSelector{}
 	if reflect.DeepEqual(d.Spec.Selector, &everything) {
 		if d.Status.ObservedGeneration < d.Generation {
@@ -116,7 +118,7 @@ func (r *MachineDeploymentReconciler) reconcile(ctx context.Context, d *clusterv
 				return ctrl.Result{}, err
 			}
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{}, nil
 	}
 
 	// Make sure that label selector can match the template's labels.
@@ -144,12 +146,17 @@ func (r *MachineDeploymentReconciler) reconcile(ctx context.Context, d *clusterv
 	}
 
 	if cluster != nil && r.shouldAdopt(d) {
+		patch := client.MergeFrom(d.DeepCopy())
 		d.OwnerReferences = util.EnsureOwnerRef(d.OwnerReferences, metav1.OwnerReference{
 			APIVersion: cluster.APIVersion,
 			Kind:       cluster.Kind,
 			Name:       cluster.Name,
 			UID:        cluster.UID,
 		})
+		// Patch using a deep copy to avoid overwriting any unexpected Status changes from the returned result
+		if err := r.Client.Patch(ctx, d.DeepCopy(), patch); err != nil {
+			return ctrl.Result{}, errors.Wrapf(err, "Failed to add OwnerReference to MachineDeployment %s/%s", d.Namespace, d.Name)
+		}
 	}
 
 	msList, err := r.getMachineSetsForDeployment(d)
@@ -198,7 +205,8 @@ func (r *MachineDeploymentReconciler) getMachineSetsForDeployment(d *clusterv1.M
 			continue
 		}
 
-		if !selector.Matches(labels.Set(ms.Labels)) {
+		// Skip this MachineSet unless either selector matches or it has a controller ref pointing to this MachineDeployment
+		if !selector.Matches(labels.Set(ms.Labels)) && !metav1.IsControlledBy(ms, d) {
 			klog.V(4).Infof("Skipping MachineSet %v, label mismatch", ms.Name)
 			continue
 		}

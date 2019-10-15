@@ -226,10 +226,15 @@ release-binary: $(RELEASE_DIR)
 		go build -a -ldflags '-extldflags "-static"' \
 		-o $(RELEASE_DIR)/$(notdir $(RELEASE_BINARY))-$(GOOS)-$(GOARCH) $(RELEASE_BINARY)
 
-.PHONY: release-staging-latest
-release-staging-latest: ## Builds and push container images to the staging bucket using "latest" tag.
-	REGISTRY=$(STAGING_REGISTRY) TAG=latest \
-		$(MAKE) docker-build-all docker-push-all
+.PHONY: release-staging
+release-staging: ## Builds and push container images to the staging bucket.
+	REGISTRY=$(STAGING_REGISTRY) $(MAKE) docker-build-all docker-push-all release-alias-tag
+
+RELEASE_ALIAS_TAG=$(shell if [ "$(PULL_BASE_REF)" = "master" ]; then echo "latest"; else echo "$(PULL_BASE_REF)"; fi)
+
+.PHONY: release-alias-tag
+release-alias-tag: # Adds the tag to the last build tag.
+	gcloud container images add-tag $(CONTROLLER_IMG):$(TAG) $(CONTROLLER_IMG):$(RELEASE_ALIAS_TAG)
 
 ## --------------------------------------
 ## Docker - Example Provider
@@ -265,6 +270,13 @@ verify:
 	./hack/verify-boilerplate.sh
 	./hack/verify-doctoc.sh
 	./hack/verify-generated-files.sh
+	$(MAKE) verify-modules
+
+.PHONY: verify-modules
+verify-modules: modules
+	@if !(git diff --quiet HEAD -- go.sum go.mod hack/tools/go.mod hack/tools/go.sum); then \
+		echo "go module files are out of date"; exit 1; \
+	fi
 
 .PHONY: clean-book
 clean-book: ## Remove all generated GitBook files
@@ -280,4 +292,4 @@ diagrams: ## Build proposal diagrams
 
 .PHONY: serve-book
 serve-book: ## Build and serve the book with live-reloading enabled
-	(cd ./docs/book && mdbook serve)
+	$(MAKE) -C docs/book serve
