@@ -358,9 +358,13 @@ func calculateStatus(allMSs []*clusterv1.MachineSet, newMS *clusterv1.MachineSet
 		unavailableReplicas = 0
 	}
 
+	// Calculate the label selector. We check the error in the MD reconcile function, ignore here.
+	selector, _ := metav1.LabelSelectorAsSelector(&deployment.Spec.Selector) //nolint
+
 	status := clusterv1.MachineDeploymentStatus{
 		// TODO: Ensure that if we start retrying status updates, we won't pick up a new Generation value.
 		ObservedGeneration:  deployment.Generation,
+		Selector:            selector.String(),
 		Replicas:            mdutil.GetActualReplicaCountForMachineSets(allMSs),
 		UpdatedReplicas:     mdutil.GetActualReplicaCountForMachineSets([]*clusterv1.MachineSet{newMS}),
 		ReadyReplicas:       mdutil.GetReadyReplicaCountForMachineSets(allMSs),
@@ -472,32 +476,6 @@ func (r *MachineDeploymentReconciler) cleanupDeployment(oldMSs []*clusterv1.Mach
 	}
 
 	return nil
-}
-
-// isScalingEvent checks whether the provided deployment has been updated with a scaling event
-// by looking at the desired-replicas annotation in the active machine sets of the deployment.
-//
-// msList should come from getMachineSetsForDeployment(d).
-// machineMap should come from getMachineMapForDeployment(d, msList).
-func (r *MachineDeploymentReconciler) isScalingEvent(d *clusterv1.MachineDeployment, msList []*clusterv1.MachineSet, machineMap map[types.UID]*clusterv1.MachineList) (bool, error) {
-	if d.Spec.Replicas == nil {
-		return false, errors.Errorf("spec replicas for deployment %v is nil, this is unexpected", d.Name)
-	}
-	newMS, oldMSs, err := r.getAllMachineSetsAndSyncRevision(d, msList, machineMap, false)
-	if err != nil {
-		return false, err
-	}
-	allMSs := append(oldMSs, newMS)
-	for _, ms := range mdutil.FilterActiveMachineSets(allMSs) {
-		desired, ok := mdutil.GetDesiredReplicasAnnotation(ms)
-		if !ok {
-			continue
-		}
-		if desired != *(d.Spec.Replicas) {
-			return true, nil
-		}
-	}
-	return false, nil
 }
 
 func (r *MachineDeploymentReconciler) updateMachineDeployment(d *clusterv1.MachineDeployment, modify func(*clusterv1.MachineDeployment)) error {

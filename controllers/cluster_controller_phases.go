@@ -33,8 +33,8 @@ import (
 	capierrors "sigs.k8s.io/cluster-api/errors"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/kubeconfig"
+	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/secret"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
@@ -78,7 +78,11 @@ func (r *ClusterReconciler) reconcileExternal(ctx context.Context, cluster *clus
 		return nil, err
 	}
 
-	objPatch := client.MergeFrom(obj.DeepCopy())
+	// Initialize the patch helper.
+	patchHelper, err := patch.NewHelper(obj, r.Client)
+	if err != nil {
+		return nil, err
+	}
 
 	// Set external object OwnerReference to the Cluster.
 	ownerRef := metav1.OwnerReference{
@@ -88,13 +92,12 @@ func (r *ClusterReconciler) reconcileExternal(ctx context.Context, cluster *clus
 		UID:        cluster.UID,
 	}
 
-	if !util.HasOwnerRef(obj.GetOwnerReferences(), ownerRef) {
-		obj.SetOwnerReferences(util.EnsureOwnerRef(obj.GetOwnerReferences(), ownerRef))
-		if err := r.Client.Patch(ctx, obj, objPatch); err != nil {
-			return nil, errors.Wrapf(err,
-				"failed to set OwnerReference on %v %q for Cluster %q in namespace %q",
-				obj.GroupVersionKind(), ref.Name, cluster.Name, cluster.Namespace)
-		}
+	// Add ownerRef to object.
+	obj.SetOwnerReferences(util.EnsureOwnerRef(obj.GetOwnerReferences(), ownerRef))
+
+	// Always attempt to Patch the external object.
+	if err := patchHelper.Patch(ctx, obj); err != nil {
+		return nil, err
 	}
 
 	// Add watcher for external object, if there isn't one already.
@@ -181,7 +184,14 @@ func (r *ClusterReconciler) reconcileKubeconfig(ctx context.Context, cluster *cl
 	_, err := secret.Get(r.Client, cluster, secret.Kubeconfig)
 	switch {
 	case apierrors.IsNotFound(err):
-		return kubeconfig.CreateSecret(ctx, r.Client, cluster)
+		if err := kubeconfig.CreateSecret(ctx, r.Client, cluster); err != nil {
+			if err == kubeconfig.ErrDependentCertificateNotFound {
+				return errors.Wrapf(&capierrors.RequeueAfterError{RequeueAfter: 30 * time.Second},
+					"could not find secret %q for Cluster %q in namespace %q, requeuing",
+					secret.ClusterCA, cluster.Name, cluster.Namespace)
+			}
+			return err
+		}
 	case err != nil:
 		return errors.Wrapf(err, "failed to retrieve Kubeconfig Secret for Cluster %q in namespace %q", cluster.Name, cluster.Namespace)
 	}
