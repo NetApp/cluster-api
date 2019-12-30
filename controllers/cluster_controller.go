@@ -31,12 +31,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/klog"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 	"sigs.k8s.io/cluster-api/controllers/external"
+	"sigs.k8s.io/cluster-api/controllers/metrics"
 	capierrors "sigs.k8s.io/cluster-api/errors"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/patch"
+	"sigs.k8s.io/cluster-api/util/secret"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -54,7 +55,7 @@ const (
 // +kubebuilder:rbac:groups=core,resources=events,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io;bootstrap.cluster.x-k8s.io,resources=*,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io;bootstrap.cluster.x-k8s.io;controlplane.cluster.x-k8s.io,resources=*,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;clusters/status,verbs=get;list;watch;create;update;patch;delete
 
 // ClusterReconciler reconciles a Cluster object
@@ -68,7 +69,7 @@ type ClusterReconciler struct {
 }
 
 func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
-	c, err := ctrl.NewControllerManagedBy(mgr).
+	controller, err := ctrl.NewControllerManagedBy(mgr).
 		For(&clusterv1.Cluster{}).
 		Watches(
 			&source.Kind{Type: &clusterv1.Machine{}},
@@ -77,14 +78,17 @@ func (r *ClusterReconciler) SetupWithManager(mgr ctrl.Manager, options controlle
 		WithOptions(options).
 		Build(r)
 
-	r.controller = c
+	if err != nil {
+		return errors.Wrap(err, "failed setting up with a controller manager")
+	}
+
+	r.controller = controller
 	r.recorder = mgr.GetEventRecorderFor("cluster-controller")
-	return err
+	return nil
 }
 
 func (r *ClusterReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, reterr error) {
 	ctx := context.Background()
-	_ = r.Log.WithValues("cluster", req.NamespacedName)
 
 	// Fetch the Cluster instance.
 	cluster := &clusterv1.Cluster{}
@@ -108,6 +112,7 @@ func (r *ClusterReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, reterr e
 	defer func() {
 		// Always reconcile the Status.Phase field.
 		r.reconcilePhase(ctx, cluster)
+		r.reconcileMetrics(ctx, cluster)
 
 		// Always attempt to Patch the Cluster object and status after each reconciliation.
 		if err := patchHelper.Patch(ctx, cluster); err != nil {
@@ -128,14 +133,17 @@ func (r *ClusterReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, reterr e
 
 // reconcile handles cluster reconciliation.
 func (r *ClusterReconciler) reconcile(ctx context.Context, cluster *clusterv1.Cluster) (ctrl.Result, error) {
+	logger := r.Log.WithValues("cluster", cluster.Name, "namespace", cluster.Namespace)
+
 	// If object doesn't have a finalizer, add one.
 	if !util.Contains(cluster.Finalizers, clusterv1.ClusterFinalizer) {
-		cluster.Finalizers = append(cluster.ObjectMeta.Finalizers, clusterv1.ClusterFinalizer)
+		cluster.Finalizers = append(cluster.Finalizers, clusterv1.ClusterFinalizer)
 	}
 
 	// Call the inner reconciliation methods.
 	reconciliationErrors := []error{
 		r.reconcileInfrastructure(ctx, cluster),
+		r.reconcileControlPlane(ctx, cluster),
 		r.reconcileKubeconfig(ctx, cluster),
 		r.reconcileControlPlaneInitialized(ctx, cluster),
 	}
@@ -149,7 +157,7 @@ func (r *ClusterReconciler) reconcile(ctx context.Context, cluster *clusterv1.Cl
 			if !res.Requeue {
 				res.Requeue = true
 				res.RequeueAfter = requeueErr.GetRequeueAfter()
-				klog.Infof("Reconciliation for Cluster %q in namespace %q asked to requeue: %v", cluster.Name, cluster.Namespace, err)
+				logger.Error(err, "Reconciliation for Cluster asked to requeue")
 			}
 			continue
 		}
@@ -159,23 +167,60 @@ func (r *ClusterReconciler) reconcile(ctx context.Context, cluster *clusterv1.Cl
 	return res, kerrors.NewAggregate(errs)
 }
 
+func (r *ClusterReconciler) reconcileMetrics(_ context.Context, cluster *clusterv1.Cluster) {
+
+	if cluster.Status.ControlPlaneInitialized {
+		metrics.ClusterControlPlaneReady.WithLabelValues(cluster.Name, cluster.Namespace).Set(1)
+	} else {
+		metrics.ClusterControlPlaneReady.WithLabelValues(cluster.Name, cluster.Namespace).Set(0)
+	}
+
+	if cluster.Status.InfrastructureReady {
+		metrics.ClusterInfrastructureReady.WithLabelValues(cluster.Name, cluster.Namespace).Set(1)
+	} else {
+		metrics.ClusterInfrastructureReady.WithLabelValues(cluster.Name, cluster.Namespace).Set(0)
+	}
+
+	// TODO: [wfernandes] pass context here
+	_, err := secret.Get(r.Client, cluster, secret.Kubeconfig)
+	if err != nil {
+		metrics.ClusterKubeconfigReady.WithLabelValues(cluster.Name, cluster.Namespace).Set(0)
+	} else {
+		metrics.ClusterKubeconfigReady.WithLabelValues(cluster.Name, cluster.Namespace).Set(1)
+	}
+
+	if cluster.Status.FailureReason != nil || cluster.Status.FailureMessage != nil {
+		metrics.ClusterFailureSet.WithLabelValues(cluster.Name, cluster.Namespace).Set(1)
+	} else {
+		metrics.ClusterFailureSet.WithLabelValues(cluster.Name, cluster.Namespace).Set(0)
+	}
+}
+
 // reconcileDelete handles cluster deletion.
 func (r *ClusterReconciler) reconcileDelete(ctx context.Context, cluster *clusterv1.Cluster) (reconcile.Result, error) {
-	children, err := r.listChildren(ctx, cluster)
+	logger := r.Log.WithValues("cluster", cluster.Name, "namespace", cluster.Namespace)
+
+	descendants, err := r.listDescendants(ctx, cluster)
 	if err != nil {
-		klog.Errorf("Failed to list children of cluster %s/%s: %v", cluster.Namespace, cluster.Name, err)
+		logger.Error(err, "Failed to list descendants")
+		return reconcile.Result{}, err
+	}
+
+	children, err := descendants.filterOwnedDescendants(cluster)
+	if err != nil {
+		logger.Error(err, "Failed to extract direct descendants")
 		return reconcile.Result{}, err
 	}
 
 	if len(children) > 0 {
-		klog.Infof("Cluster %s/%s still has %d children - deleting them first", cluster.Namespace, cluster.Name, len(children))
+		logger.Info("Cluster still has children - deleting them first", "count", len(children))
 
 		var errs []error
 
 		for _, child := range children {
 			accessor, err := meta.Accessor(child)
 			if err != nil {
-				klog.Errorf("Cluster %s/%s: couldn't create accessor for type %T: %v", cluster.Namespace, cluster.Name, child, err)
+				logger.Error(err, "Couldn't create accessor", "type", fmt.Sprintf("%T", child))
 				continue
 			}
 
@@ -186,10 +231,10 @@ func (r *ClusterReconciler) reconcileDelete(ctx context.Context, cluster *cluste
 
 			gvk := child.GetObjectKind().GroupVersionKind().String()
 
-			klog.Infof("Cluster %s/%s: deleting child %s %s", cluster.Namespace, cluster.Name, gvk, accessor.GetName())
+			logger.Info("Deleting child", "gvk", gvk, "name", accessor.GetName())
 			if err := r.Client.Delete(context.Background(), child); err != nil {
 				err = errors.Wrapf(err, "error deleting cluster %s/%s: failed to delete %s %s", cluster.Namespace, cluster.Name, gvk, accessor.GetName())
-				klog.Errorf(err.Error())
+				logger.Error(err, "Error deleting resource", "gvk", gvk, "name", accessor.GetName())
 				errs = append(errs, err)
 			}
 		}
@@ -197,15 +242,19 @@ func (r *ClusterReconciler) reconcileDelete(ctx context.Context, cluster *cluste
 		if len(errs) > 0 {
 			return ctrl.Result{}, kerrors.NewAggregate(errs)
 		}
+	}
 
-		// Requeue so we can check the next time to see if there are still any children left.
+	if descendantCount := descendants.length(); descendantCount > 0 {
+		indirect := descendantCount - len(children)
+		logger.Info("Cluster still has descendants - need to requeue", "direct", len(children), "indirect", indirect)
+		// Requeue so we can check the next time to see if there are still any descendants left.
 		return ctrl.Result{RequeueAfter: deleteRequeueAfter}, nil
 	}
 
 	if cluster.Spec.InfrastructureRef != nil {
-		obj, err := external.Get(r.Client, cluster.Spec.InfrastructureRef, cluster.Namespace)
+		obj, err := external.Get(ctx, r.Client, cluster.Spec.InfrastructureRef, cluster.Namespace)
 		switch {
-		case apierrors.IsNotFound(err):
+		case apierrors.IsNotFound(errors.Cause(err)):
 			// All good - the infra resource has been deleted
 		case err != nil:
 			return ctrl.Result{}, errors.Wrapf(err, "failed to get %s %q for Cluster %s/%s",
@@ -229,57 +278,81 @@ func (r *ClusterReconciler) reconcileDelete(ctx context.Context, cluster *cluste
 	return ctrl.Result{}, nil
 }
 
-// listChildren returns a list of MachineDeployments, MachineSets, and Machines than have an owner reference to cluster
-func (r *ClusterReconciler) listChildren(ctx context.Context, cluster *clusterv1.Cluster) ([]runtime.Object, error) {
+type clusterDescendants struct {
+	machineDeployments   clusterv1.MachineDeploymentList
+	machineSets          clusterv1.MachineSetList
+	controlPlaneMachines clusterv1.MachineList
+	workerMachines       clusterv1.MachineList
+}
+
+// length returns the number of descendants
+func (c *clusterDescendants) length() int {
+	return len(c.machineDeployments.Items) +
+		len(c.machineSets.Items) +
+		len(c.controlPlaneMachines.Items) +
+		len(c.workerMachines.Items)
+}
+
+// listDescendants returns a list of all MachineDeployments, MachineSets, and Machines for the cluster.
+func (r *ClusterReconciler) listDescendants(ctx context.Context, cluster *clusterv1.Cluster) (clusterDescendants, error) {
+	var descendants clusterDescendants
+
 	listOptions := []client.ListOption{
 		client.InNamespace(cluster.Namespace),
-		client.MatchingLabels(map[string]string{clusterv1.MachineClusterLabelName: cluster.Name}),
+		client.MatchingLabels(map[string]string{clusterv1.ClusterLabelName: cluster.Name}),
 	}
 
-	machineDeployments := &clusterv1.MachineDeploymentList{}
-	if err := r.Client.List(ctx, machineDeployments, listOptions...); err != nil {
-		return nil, errors.Wrapf(err, "failed to list MachineDeployments for cluster %s/%s", cluster.Namespace, cluster.Name)
+	if err := r.Client.List(ctx, &descendants.machineDeployments, listOptions...); err != nil {
+		return descendants, errors.Wrapf(err, "failed to list MachineDeployments for cluster %s/%s", cluster.Namespace, cluster.Name)
 	}
 
-	machineSets := &clusterv1.MachineSetList{}
-	if err := r.Client.List(ctx, machineSets, listOptions...); err != nil {
-		return nil, errors.Wrapf(err, "failed to list MachineSets for cluster %s/%s", cluster.Namespace, cluster.Name)
+	if err := r.Client.List(ctx, &descendants.machineSets, listOptions...); err != nil {
+		return descendants, errors.Wrapf(err, "failed to list MachineSets for cluster %s/%s", cluster.Namespace, cluster.Name)
 	}
 
-	allMachines := &clusterv1.MachineList{}
-	if err := r.Client.List(ctx, allMachines, listOptions...); err != nil {
-		return nil, errors.Wrapf(err, "failed to list Machines for cluster %s/%s", cluster.Namespace, cluster.Name)
+	var machines clusterv1.MachineList
+	if err := r.Client.List(ctx, &machines, listOptions...); err != nil {
+		return descendants, errors.Wrapf(err, "failed to list Machines for cluster %s/%s", cluster.Namespace, cluster.Name)
 	}
-	controlPlaneMachines, machines := splitMachineList(allMachines)
 
-	var children []runtime.Object
+	// Split machines into control plane and worker machines so we make sure we delete control plane machines last
+	controlPlaneMachines, workerMachines := splitMachineList(&machines)
+	descendants.controlPlaneMachines = *controlPlaneMachines
+	descendants.workerMachines = *workerMachines
+
+	return descendants, nil
+}
+
+// filterOwnedDescendants returns an array of runtime.Objects containing only those descendants that have the cluster
+// as an owner reference, with control plane machines sorted last.
+func (c clusterDescendants) filterOwnedDescendants(cluster *clusterv1.Cluster) ([]runtime.Object, error) {
+	var ownedDescendants []runtime.Object
 	eachFunc := func(o runtime.Object) error {
 		acc, err := meta.Accessor(o)
 		if err != nil {
-			klog.Errorf("Cluster %s/%s: couldn't create accessor for type %T: %v", cluster.Namespace, cluster.Name, o, err)
 			return nil
 		}
 
 		if util.PointsTo(acc.GetOwnerReferences(), &cluster.ObjectMeta) {
-			children = append(children, o)
+			ownedDescendants = append(ownedDescendants, o)
 		}
 
 		return nil
 	}
 
 	lists := []runtime.Object{
-		machineDeployments,
-		machineSets,
-		machines,
-		controlPlaneMachines,
+		&c.machineDeployments,
+		&c.machineSets,
+		&c.workerMachines,
+		&c.controlPlaneMachines,
 	}
 	for _, list := range lists {
 		if err := meta.EachListItem(list, eachFunc); err != nil {
-			return nil, errors.Wrapf(err, "error finding children of cluster %s/%s", cluster.Namespace, cluster.Name)
+			return nil, errors.Wrapf(err, "error finding owned descendants of cluster %s/%s", cluster.Namespace, cluster.Name)
 		}
 	}
 
-	return children, nil
+	return ownedDescendants, nil
 }
 
 // splitMachineList separates the machines running the control plane from other worker nodes.
@@ -298,13 +371,15 @@ func splitMachineList(list *clusterv1.MachineList) (*clusterv1.MachineList, *clu
 }
 
 func (r *ClusterReconciler) reconcileControlPlaneInitialized(ctx context.Context, cluster *clusterv1.Cluster) error {
+	logger := r.Log.WithValues("cluster", cluster.Name, "namespace", cluster.Namespace)
+
 	if cluster.Status.ControlPlaneInitialized {
 		return nil
 	}
 
 	machines, err := getActiveMachinesInCluster(ctx, r.Client, cluster.Namespace, cluster.Name)
 	if err != nil {
-		r.Log.Error(err, "error getting machines in cluster", "cluster", cluster.Name, "namespace", cluster.Namespace)
+		logger.Error(err, "Error getting machines in cluster")
 		return err
 	}
 
@@ -323,7 +398,7 @@ func (r *ClusterReconciler) reconcileControlPlaneInitialized(ctx context.Context
 func (r *ClusterReconciler) controlPlaneMachineToCluster(o handler.MapObject) []ctrl.Request {
 	m, ok := o.Object.(*clusterv1.Machine)
 	if !ok {
-		r.Log.Error(errors.New("did not get machine"), "got", fmt.Sprintf("%T", o.Object))
+		r.Log.Error(nil, fmt.Sprintf("Expected a Machine but got a %T", o.Object))
 		return nil
 	}
 	if !util.IsControlPlaneMachine(m) {
@@ -333,9 +408,9 @@ func (r *ClusterReconciler) controlPlaneMachineToCluster(o handler.MapObject) []
 		return nil
 	}
 
-	cluster, err := util.GetClusterFromMetadata(context.TODO(), r.Client, m.ObjectMeta)
+	cluster, err := util.GetClusterByName(context.TODO(), r.Client, m.ObjectMeta.Namespace, m.Spec.ClusterName)
 	if err != nil {
-		r.Log.Error(err, "failed to get cluster", "machine", m.Name, "cluster", m.ClusterName, "namespace", m.Namespace)
+		r.Log.Error(err, "Failed to get cluster", "machine", m.Name, "cluster", m.ClusterName, "namespace", m.Namespace)
 		return nil
 	}
 

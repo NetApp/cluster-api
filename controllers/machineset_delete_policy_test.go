@@ -17,11 +17,12 @@ limitations under the License.
 package controllers
 
 import (
-	"reflect"
 	"testing"
 
+	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
+
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 	capierrors "sigs.k8s.io/cluster-api/errors"
 )
 
@@ -29,7 +30,7 @@ func TestMachineToDelete(t *testing.T) {
 	msg := "something wrong with the machine"
 	now := metav1.Now()
 	mustDeleteMachine := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{DeletionTimestamp: &now}}
-	betterDeleteMachine := &clusterv1.Machine{Status: clusterv1.MachineStatus{ErrorMessage: &msg}}
+	betterDeleteMachine := &clusterv1.Machine{Status: clusterv1.MachineStatus{FailureMessage: &msg}}
 	deleteMeMachine := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{DeleteNodeAnnotation: "yes"}}}
 
 	tests := []struct {
@@ -151,10 +152,10 @@ func TestMachineToDelete(t *testing.T) {
 		}}
 
 	for _, test := range tests {
+		g := NewWithT(t)
+
 		result := getMachinesToDeletePrioritized(test.machines, test.diff, randomDeletePolicy)
-		if !reflect.DeepEqual(result, test.expect) {
-			t.Errorf("[case %s]", test.desc)
-		}
+		g.Expect(result).To(Equal(test.expect))
 	}
 }
 
@@ -168,7 +169,7 @@ func TestMachineNewestDelete(t *testing.T) {
 	old := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(currentTime.Time.AddDate(0, 0, -10))}}
 	oldest := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(currentTime.Time.AddDate(0, 0, -10))}}
 	annotatedMachine := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{DeleteNodeAnnotation: "yes"}, CreationTimestamp: metav1.NewTime(currentTime.Time.AddDate(0, 0, -10))}}
-	unhealthyMachine := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(currentTime.Time.AddDate(0, 0, -10))}, Status: clusterv1.MachineStatus{ErrorReason: &statusError}}
+	unhealthyMachine := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(currentTime.Time.AddDate(0, 0, -10))}, Status: clusterv1.MachineStatus{FailureReason: &statusError}}
 
 	tests := []struct {
 		desc     string
@@ -219,10 +220,10 @@ func TestMachineNewestDelete(t *testing.T) {
 	}
 
 	for _, test := range tests {
+		g := NewWithT(t)
+
 		result := getMachinesToDeletePrioritized(test.machines, test.diff, newestDeletePriority)
-		if !reflect.DeepEqual(result, test.expect) {
-			t.Errorf("[case %s]", test.desc)
-		}
+		g.Expect(result).To(Equal(test.expect))
 	}
 }
 
@@ -236,7 +237,7 @@ func TestMachineOldestDelete(t *testing.T) {
 	old := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(currentTime.Time.AddDate(0, 0, -10))}}
 	oldest := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(currentTime.Time.AddDate(0, 0, -10))}}
 	annotatedMachine := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{DeleteNodeAnnotation: "yes"}, CreationTimestamp: metav1.NewTime(currentTime.Time.AddDate(0, 0, -10))}}
-	unhealthyMachine := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(currentTime.Time.AddDate(0, 0, -10))}, Status: clusterv1.MachineStatus{ErrorReason: &statusError}}
+	unhealthyMachine := &clusterv1.Machine{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(currentTime.Time.AddDate(0, 0, -10))}, Status: clusterv1.MachineStatus{FailureReason: &statusError}}
 
 	tests := []struct {
 		desc     string
@@ -295,9 +296,9 @@ func TestMachineOldestDelete(t *testing.T) {
 	}
 
 	for _, test := range tests {
+		g := NewWithT(t)
+
 		result := getMachinesToDeletePrioritized(test.machines, test.diff, oldestDeletePriority)
-		if !reflect.DeepEqual(result, test.expect) {
-			t.Errorf("[case %s]", test.desc)
-		}
+		g.Expect(result).To(Equal(test.expect))
 	}
 }

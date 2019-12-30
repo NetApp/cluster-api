@@ -17,15 +17,18 @@ limitations under the License.
 package remote
 
 import (
-	"strings"
 	"testing"
 
+	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
-	"sigs.k8s.io/cluster-api/util/secret"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
+	"sigs.k8s.io/cluster-api/util/secret"
 )
 
 var (
@@ -89,37 +92,33 @@ users:
 )
 
 func TestNewClusterClient(t *testing.T) {
+	g := NewWithT(t)
+
+	testScheme := runtime.NewScheme()
+	g.Expect(scheme.AddToScheme(testScheme)).To(Succeed())
+
 	t.Run("cluster with valid kubeconfig", func(t *testing.T) {
-		client := fake.NewFakeClient(validSecret)
-		c, err := NewClusterClient(client, clusterWithValidKubeConfig)
-		if err != nil {
-			t.Fatalf("Expected no errors, got %v", err)
-		}
+		client := fake.NewFakeClientWithScheme(testScheme, validSecret)
+		c, err := NewClusterClient(client, clusterWithValidKubeConfig, testScheme)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(c).NotTo(BeNil())
 
-		if c == nil {
-			t.Fatal("Expected actual client, got nil")
-		}
-
-		restConfig := c.RESTConfig()
-		if restConfig.Host != "https://test-cluster-api:6443" {
-			t.Fatalf("Unexpected Host value in RESTConfig: %q", restConfig.Host)
-		}
+		restConfig, err := RESTConfig(client, clusterWithValidKubeConfig)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(restConfig.Host).To(Equal("https://test-cluster-api:6443"))
 	})
 
 	t.Run("cluster with no kubeconfig", func(t *testing.T) {
-		client := fake.NewFakeClient()
-		_, err := NewClusterClient(client, clusterWithNoKubeConfig)
-		if !strings.Contains(err.Error(), "not found") {
-			t.Fatalf("Expected not found error, got %v", err)
-		}
+		client := fake.NewFakeClientWithScheme(testScheme)
+		_, err := NewClusterClient(client, clusterWithNoKubeConfig, testScheme)
+		g.Expect(err).To(MatchError(ContainSubstring("not found")))
 	})
 
 	t.Run("cluster with invalid kubeconfig", func(t *testing.T) {
-		client := fake.NewFakeClient(invalidSecret)
-		_, err := NewClusterClient(client, clusterWithInvalidKubeConfig)
-		if err == nil || apierrors.IsNotFound(err) {
-			t.Fatalf("Expected error, got %v", err)
-		}
+		client := fake.NewFakeClientWithScheme(testScheme, invalidSecret)
+		_, err := NewClusterClient(client, clusterWithInvalidKubeConfig, testScheme)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(apierrors.IsNotFound(err)).To(BeFalse())
 	})
 
 }

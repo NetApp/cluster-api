@@ -17,25 +17,28 @@ limitations under the License.
 package controllers
 
 import (
-	"strings"
 	"testing"
 
+	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	fakeclient "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
-	"sigs.k8s.io/cluster-api/controllers/noderefutil"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
+	"sigs.k8s.io/cluster-api/controllers/noderefutil"
 )
 
 func TestGetNodeReference(t *testing.T) {
-	clusterv1.AddToScheme(scheme.Scheme)
+	g := NewWithT(t)
+
+	g.Expect(clusterv1.AddToScheme(scheme.Scheme)).To(Succeed())
+
 	r := &MachineReconciler{
-		Client:   fake.NewFakeClient(),
+		Client:   fake.NewFakeClientWithScheme(scheme.Scheme),
 		Log:      log.Log,
 		recorder: record.NewFakeRecorder(32),
 	}
@@ -67,7 +70,7 @@ func TestGetNodeReference(t *testing.T) {
 		},
 	}
 
-	coreV1Client := fakeclient.NewSimpleClientset(nodeList...).CoreV1()
+	client := fake.NewFakeClientWithScheme(scheme.Scheme, nodeList...)
 
 	testCases := []struct {
 		name       string
@@ -100,29 +103,24 @@ func TestGetNodeReference(t *testing.T) {
 
 	for _, test := range testCases {
 		t.Run(test.name, func(t *testing.T) {
+			gt := NewWithT(t)
 			providerID, err := noderefutil.NewProviderID(test.providerID)
-			if err != nil {
-				t.Fatalf("Expected no error parsing provider id %q, got %v", test.providerID, err)
-			}
+			gt.Expect(err).NotTo(HaveOccurred(), "Expected no error parsing provider id %q, got %v", test.providerID, err)
 
-			reference, err := r.getNodeReference(coreV1Client, providerID)
-			if err != nil {
-				if (test.err != nil && !strings.Contains(err.Error(), test.err.Error())) || test.err == nil {
-					t.Fatalf("Expected error %v, got %v", test.err, err)
-				}
+			reference, err := r.getNodeReference(client, providerID)
+			if test.err == nil {
+				g.Expect(err).To(BeNil())
+			} else {
+				gt.Expect(err).NotTo(BeNil())
+				gt.Expect(err).To(Equal(test.err), "Expected error %v, got %v", test.err, err)
 			}
 
 			if test.expected == nil && reference == nil {
 				return
 			}
 
-			if reference.Name != test.expected.Name {
-				t.Fatalf("Expected NodeRef's name to be %v, got %v", reference.Name, test.expected.Name)
-			}
-
-			if reference.Namespace != test.expected.Namespace {
-				t.Fatalf("Expected NodeRef's namespace to be %v, got %v", reference.Namespace, test.expected.Namespace)
-			}
+			gt.Expect(reference.Name).To(Equal(test.expected.Name), "Expected NodeRef's name to be %v, got %v", reference.Name, test.expected.Name)
+			gt.Expect(reference.Namespace).To(Equal(test.expected.Namespace), "Expected NodeRef's namespace to be %v, got %v", reference.Namespace, test.expected.Namespace)
 		})
 
 	}

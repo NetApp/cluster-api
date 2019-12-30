@@ -1,11 +1,13 @@
 # Cluster Controller
 
+![](../../images/cluster-admission-cluster-controller.svg)
+
 The Cluster controller's main responsibilities are:
 
 * Setting an OwnerReference on the infrastructure object referenced in `Cluster.Spec.InfrastructureRef`.
 * Cleanup of all owned objects so that nothing is dangling after deletion.
 * Keeping the Cluster's status in sync with the infrastructure Cluster's status.
-* Creating a kubeconfig secret for [target clusters](../reference/glossary#Workload cluster).
+* Creating a kubeconfig secret for [workload clusters](../../reference/glossary.html#workload-cluster).
 
 ## Contracts
 
@@ -21,28 +23,31 @@ provisions EC2 instances that will become a Kubernetes cluster through some boot
 
 The InfrastructureCluster object **must** have a `status` object.
 
-The `status` object **must** have several fields defined:
+The `spec` object **must** have the following fields defined:
 
-* `ready` - a boolean field that is true when the infrastructure is ready to be used.
-* `apiEndpoints` - a slice of strings that identifies each control plane node's apiserver endpoint or a slice with only
-one endpoint that is a load balancer for all control plane nodes.
+- `controlPlaneEndpoint` - identifies the endpoint used to connect to the target's cluster apiserver.
+
+The `status` object **must** have the following fields defined:
+
+- `ready` - a boolean field that is true when the infrastructure is ready to be used.
 
 #### Optional `status` fields
 
-The `status` object **may** define several fields that do not affect functionality if missing.
+The `status` object **may** define several fields that do not affect functionality if missing:
 
-* `errorReason` - is a string that explains why an error has occurred, if possible.
-* `errorMessage` - is a string that holds the message contained by the error.
+* `failureReason` - is a string that explains why a fatal error has occurred, if possible.
+* `failureMessage` - is a string that holds the message contained by the error.
 
 Example:
 ```yaml
 kind: MyProviderCluster
-apiVersion: infrastructure.cluster.x-k8s.io/v1alpha2
+apiVersion: infrastructure.cluster.x-k8s.io/v1alpha3
+spec:
+  controlPlaneEndpoint:
+    host: example.com
+    port: 6443
 status:
     ready: true
-    apiEndpoints:
-    - example.com:3333
-    - example.com:3334
 ```
 
 ### Secrets
@@ -64,3 +69,4 @@ formatted as described below.
 | Secret name | Field name | Content |
 |:---:|:---:|:---:|
 |`<cluster-name>-kubeconfig`|`value`|base64 encoded kubeconfig|
+

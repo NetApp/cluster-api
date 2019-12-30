@@ -30,7 +30,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -102,7 +102,7 @@ var _ = Describe("Cluster-Controller", func() {
 				if err := apiclient.Get(ctx, client.ObjectKey{Name: cluster.Name, Namespace: cluster.Namespace}, cluster); err != nil {
 					return false
 				}
-				return cluster.Status.Phase == "pending"
+				return cluster.Status.Phase == string(clusterv1.ClusterPhasePending)
 			}).Should(BeTrue())
 
 			close(done)

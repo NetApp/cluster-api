@@ -19,7 +19,7 @@ set -o nounset
 set -o pipefail
 
 REPO_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
-# shellcheck source=../hack/ensure-go.sh
+# shellcheck source=./hack/ensure-go.sh
 source "${REPO_ROOT}/hack/ensure-go.sh"
 
 MAKE="make"
@@ -30,6 +30,7 @@ CRD_YAML="crd.yaml"
 BOOTSTRAP_CLUSTER_NAME="clusterapi-bootstrap"
 CONTROLLER_REPO="controller-ci" # use arbitrary repo name since we don't need to publish it
 EXAMPLE_PROVIDER_REPO="example-provider-ci"
+CERT_MANAGER_URL="https://github.com/jetstack/cert-manager/releases/download/v0.11.0/cert-manager.yaml"
 
 GOOS=$(go env GOOS)
 GOARCH=$(go env GOARCH)
@@ -47,7 +48,7 @@ install_kubectl() {
 }
 
 install_kustomize() {
-  wget https://github.com/kubernetes-sigs/kustomize/releases/download/v${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_${GOOS}_${GOARCH} \
+  wget "https://github.com/kubernetes-sigs/kustomize/releases/download/v${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_${GOOS}_${GOARCH}" \
     --no-verbose -O /usr/local/bin/kustomize
     chmod +x /usr/local/bin/kustomize
 }
@@ -57,7 +58,7 @@ build_containers() {
    export CONTROLLER_IMG="${CONTROLLER_REPO}"
    export EXAMPLE_PROVIDER_IMG="${EXAMPLE_PROVIDER_REPO}"
 
-   "${MAKE}" docker-build TAG="${VERSION}" ARCH="${GOARCH}"
+   "${MAKE}" docker-build TAG="${VERSION}" ARCH="${GOARCH}" PULL_POLICY=IfNotPresent
    "${MAKE}" docker-build-example-provider TAG="${VERSION}" ARCH="${GOARCH}"
 }
 
@@ -130,6 +131,9 @@ main() {
    install_kustomize
    prepare_crd_yaml
    create_bootstrap
+
+   kubectl create -f "${CERT_MANAGER_URL}"
+   kubectl wait --for=condition=Available --timeout=5m apiservice v1beta1.webhook.cert-manager.io
 
    kubectl create -f "${CRD_YAML}"
 

@@ -3,6 +3,9 @@
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
 
 
+- [Prerequisites](#prerequisites)
+  - [`gcloud`](#gcloud)
+  - [`docker`](#docker)
 - [Output](#output)
   - [Expected artifacts](#expected-artifacts)
   - [Artifact locations](#artifact-locations)
@@ -10,6 +13,20 @@
   - [Permissions](#permissions)
 
 <!-- END doctoc generated TOC please keep comment here to allow auto update -->
+
+## Prerequisites
+
+### `gcloud`
+
+With gcloud, run `gcloud auth login` and select your account [listed here](https://github.com/kubernetes/k8s.io/blob/05ada8c9ff90e7921e10d86ac5d59f5c1f4f74dc/groups/groups.yaml#L113). Open a PR if your account is not listed there but you believe it should be.
+
+### `docker`
+
+Enable the [experimental features for the docker CLI](https://docs.docker.com/engine/reference/commandline/cli/#environment-variables) by setting the appropriate environment variable.
+
+```
+export DOCKER_CLI_EXPERIMENTAL=enabled
+```
 
 ## Output
 
@@ -43,10 +60,11 @@ For version v0.x.y:
     1. To use your GPG signature when pushing the tag, use `git tag -s [...]` instead
 1. Push the tag to the GitHub repository `git push origin v0.x.y`
     1. NB: `origin` should be the name of the remote pointing to `github.com/kubernetes-sigs/cluster-api`
-1. Run `make release` to build artifacts and push the images to the staging bucket
+1. Run `make release` to build artifacts (the image is automatically built by CI)
 1. Follow the [Image Promotion process](https://github.com/kubernetes/k8s.io/tree/master/k8s.gcr.io#image-promoter) to promote the image from the staging repo to `us.gcr.io/k8s-artifacts-prod/cluster-api`
 1. Create a release in GitHub based on the tag created above
-1. Manually create the release notes by going through the merged PRs since the last release
+1. Release notes can be created by running `make release-notes`, which will generate an output that can be copied to the drafted release in GitHub.
+   Pay close attention to the `## :question: Sort these by hand` section, as it contains items that need to be manually sorted.
 
 ### Permissions
 

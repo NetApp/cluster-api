@@ -22,7 +22,7 @@ import (
 
 	"github.com/pkg/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 )
 
 type (
@@ -45,13 +45,13 @@ const (
 
 // maps the creation timestamp onto the 0-100 priority range
 func oldestDeletePriority(machine *clusterv1.Machine) deletePriority {
-	if machine.DeletionTimestamp != nil && !machine.DeletionTimestamp.IsZero() {
+	if !machine.DeletionTimestamp.IsZero() {
 		return mustDelete
 	}
 	if machine.ObjectMeta.Annotations != nil && machine.ObjectMeta.Annotations[DeleteNodeAnnotation] != "" {
 		return mustDelete
 	}
-	if machine.Status.ErrorReason != nil || machine.Status.ErrorMessage != nil {
+	if machine.Status.FailureReason != nil || machine.Status.FailureMessage != nil {
 		return mustDelete
 	}
 	if machine.ObjectMeta.CreationTimestamp.Time.IsZero() {
@@ -65,26 +65,26 @@ func oldestDeletePriority(machine *clusterv1.Machine) deletePriority {
 }
 
 func newestDeletePriority(machine *clusterv1.Machine) deletePriority {
-	if machine.DeletionTimestamp != nil && !machine.DeletionTimestamp.IsZero() {
+	if !machine.DeletionTimestamp.IsZero() {
 		return mustDelete
 	}
 	if machine.ObjectMeta.Annotations != nil && machine.ObjectMeta.Annotations[DeleteNodeAnnotation] != "" {
 		return mustDelete
 	}
-	if machine.Status.ErrorReason != nil || machine.Status.ErrorMessage != nil {
+	if machine.Status.FailureReason != nil || machine.Status.FailureMessage != nil {
 		return mustDelete
 	}
 	return mustDelete - oldestDeletePriority(machine)
 }
 
 func randomDeletePolicy(machine *clusterv1.Machine) deletePriority {
-	if machine.DeletionTimestamp != nil && !machine.DeletionTimestamp.IsZero() {
+	if !machine.DeletionTimestamp.IsZero() {
 		return mustDelete
 	}
 	if machine.ObjectMeta.Annotations != nil && machine.ObjectMeta.Annotations[DeleteNodeAnnotation] != "" {
 		return betterDelete
 	}
-	if machine.Status.ErrorReason != nil || machine.Status.ErrorMessage != nil {
+	if machine.Status.FailureReason != nil || machine.Status.FailureMessage != nil {
 		return betterDelete
 	}
 	return couldDelete

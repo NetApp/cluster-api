@@ -23,26 +23,37 @@ import (
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
+)
+
+const (
+	// TemplateSuffix is the object kind suffix used by infrastructure references associated
+	// with MachineSet or MachineDeployments.
+	TemplateSuffix = "Template"
 )
 
 // Get uses the client and reference to get an external, unstructured object.
-func Get(c client.Client, ref *corev1.ObjectReference, namespace string) (*unstructured.Unstructured, error) {
+func Get(ctx context.Context, c client.Client, ref *corev1.ObjectReference, namespace string) (*unstructured.Unstructured, error) {
 	obj := new(unstructured.Unstructured)
 	obj.SetAPIVersion(ref.APIVersion)
 	obj.SetKind(ref.Kind)
 	obj.SetName(ref.Name)
 	key := client.ObjectKey{Name: obj.GetName(), Namespace: namespace}
-	if err := c.Get(context.Background(), key, obj); err != nil {
-		return nil, err
+	if err := c.Get(ctx, key, obj); err != nil {
+		return nil, errors.Wrapf(err, "failed to retrieve %s external object %q/%q", obj.GetKind(), key.Namespace, key.Name)
 	}
 	return obj, nil
 }
 
+type TemplateCloner struct{}
+
 // CloneTemplate uses the client and the reference to create a new object from the template.
-func CloneTemplate(c client.Client, ref *corev1.ObjectReference, namespace string) (*unstructured.Unstructured, error) {
-	from, err := Get(c, ref, namespace)
+func (tc *TemplateCloner) CloneTemplate(ctx context.Context, c client.Client, ref *corev1.ObjectReference, namespace, clusterName string, owner *metav1.OwnerReference) (*corev1.ObjectReference, error) {
+	from, err := Get(ctx, c, ref, namespace)
 	if err != nil {
 		return nil, err
 	}
@@ -56,13 +67,17 @@ func CloneTemplate(c client.Client, ref *corev1.ObjectReference, namespace strin
 	// Create the unstructured object from the template.
 	to := &unstructured.Unstructured{Object: template}
 	to.SetResourceVersion("")
-	to.SetOwnerReferences(nil)
+	to.SetLabels(map[string]string{clusterv1.ClusterLabelName: clusterName})
 	to.SetFinalizers(nil)
 	to.SetUID("")
 	to.SetSelfLink("")
 	to.SetName("")
 	to.SetGenerateName(fmt.Sprintf("%s-", from.GetName()))
 	to.SetNamespace(namespace)
+
+	if owner != nil {
+		to.SetOwnerReferences([]metav1.OwnerReference{*owner})
+	}
 
 	// Set the object APIVersion.
 	if to.GetAPIVersion() == "" {
@@ -71,29 +86,38 @@ func CloneTemplate(c client.Client, ref *corev1.ObjectReference, namespace strin
 
 	// Set the object Kind and strip the word "Template" if it's a suffix.
 	if to.GetKind() == "" {
-		to.SetKind(strings.TrimSuffix(ref.Kind, "Template"))
+		to.SetKind(strings.TrimSuffix(ref.Kind, TemplateSuffix))
 	}
 
 	// Create the external clone.
 	if err := c.Create(context.Background(), to); err != nil {
 		return nil, err
 	}
-	return to, nil
+
+	toRef := &corev1.ObjectReference{
+		APIVersion: to.GetAPIVersion(),
+		Kind:       to.GetKind(),
+		Name:       to.GetName(),
+		Namespace:  to.GetNamespace(),
+		UID:        to.GetUID(),
+	}
+
+	return toRef, nil
 }
 
-// ErrorsFrom returns the ErrorReason and ErrorMessage fields from the external object status.
-func ErrorsFrom(obj *unstructured.Unstructured) (string, string, error) {
-	errorReason, _, err := unstructured.NestedString(obj.Object, "status", "errorReason")
+// FailuresFrom returns the FailureReason and FailureMessage fields from the external object status.
+func FailuresFrom(obj *unstructured.Unstructured) (string, string, error) {
+	failureReason, _, err := unstructured.NestedString(obj.Object, "status", "failureReason")
 	if err != nil {
-		return "", "", errors.Wrapf(err, "failed to determine errorReason on %v %q",
+		return "", "", errors.Wrapf(err, "failed to determine failureReason on %v %q",
 			obj.GroupVersionKind(), obj.GetName())
 	}
-	errorMessage, _, err := unstructured.NestedString(obj.Object, "status", "errorMessage")
+	failureMessage, _, err := unstructured.NestedString(obj.Object, "status", "failureMessage")
 	if err != nil {
-		return "", "", errors.Wrapf(err, "failed to determine errorMessage on %v %q",
+		return "", "", errors.Wrapf(err, "failed to determine failureMessage on %v %q",
 			obj.GroupVersionKind(), obj.GetName())
 	}
-	return errorReason, errorMessage, nil
+	return failureReason, failureMessage, nil
 }
 
 // IsReady returns true if the Status.Ready field on an external object is true.
@@ -104,4 +128,14 @@ func IsReady(obj *unstructured.Unstructured) (bool, error) {
 			obj.GroupVersionKind(), obj.GetName())
 	}
 	return ready && found, nil
+}
+
+// IsInitialized returns true if the Status.Initialized field on an external object is true.
+func IsInitialized(obj *unstructured.Unstructured) (bool, error) {
+	initialized, found, err := unstructured.NestedBool(obj.Object, "status", "initialized")
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to determine %v %q initialized",
+			obj.GroupVersionKind(), obj.GetName())
+	}
+	return initialized && found, nil
 }

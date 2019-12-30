@@ -20,11 +20,12 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/go-logr/logr"
+	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/klog"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 	"sigs.k8s.io/cluster-api/controllers/noderefutil"
 	"sigs.k8s.io/cluster-api/controllers/remote"
 	"sigs.k8s.io/cluster-api/util"
@@ -37,6 +38,8 @@ const (
 )
 
 func (r *MachineSetReconciler) calculateStatus(ms *clusterv1.MachineSet, filteredMachines []*clusterv1.Machine) clusterv1.MachineSetStatus {
+	logger := r.Log.WithValues("machineset", ms.Name, "namespace", ms.Namespace)
+
 	newStatus := ms.Status
 
 	// Count the number of machines that have labels matching the labels of the machine
@@ -50,7 +53,7 @@ func (r *MachineSetReconciler) calculateStatus(ms *clusterv1.MachineSet, filtere
 	templateLabel := labels.Set(ms.Spec.Template.Labels).AsSelectorPreValidated()
 
 	// Retrieve Cluster, if any.
-	cluster, _ := util.GetClusterFromMetadata(context.Background(), r.Client, ms.ObjectMeta)
+	cluster, _ := util.GetClusterByName(context.Background(), r.Client, ms.ObjectMeta.Namespace, ms.Spec.ClusterName)
 
 	for _, machine := range filteredMachines {
 		if templateLabel.Matches(labels.Set(machine.Labels)) {
@@ -58,15 +61,13 @@ func (r *MachineSetReconciler) calculateStatus(ms *clusterv1.MachineSet, filtere
 		}
 
 		if machine.Status.NodeRef == nil {
-			klog.Warningf("Unable to retrieve Node status for Machine %q in namespace %q: missing NodeRef",
-				machine.Name, machine.Namespace)
+			logger.Info("Unable to retrieve Node status,missing NodeRef", "machine", machine.Name)
 			continue
 		}
 
 		node, err := r.getMachineNode(cluster, machine)
 		if err != nil {
-			klog.Warningf("Unable to retrieve Node status for Machine %q in namespace %q: %v",
-				machine.Name, machine.Namespace, err)
+			logger.Error(err, "Unable to retrieve Node status")
 			continue
 		}
 
@@ -86,7 +87,7 @@ func (r *MachineSetReconciler) calculateStatus(ms *clusterv1.MachineSet, filtere
 }
 
 // updateMachineSetStatus attempts to update the Status.Replicas of the given MachineSet, with a single GET/PUT retry.
-func updateMachineSetStatus(c client.Client, ms *clusterv1.MachineSet, newStatus clusterv1.MachineSetStatus) (*clusterv1.MachineSet, error) {
+func updateMachineSetStatus(c client.Client, ms *clusterv1.MachineSet, newStatus clusterv1.MachineSetStatus, logger logr.Logger) (*clusterv1.MachineSet, error) {
 	// This is the steady state. It happens when the MachineSet doesn't have any expectations, since
 	// we do a periodic relist every 10 minutes. If the generations differ but the replicas are
 	// the same, a caller might've resized to the same replica count.
@@ -110,7 +111,7 @@ func updateMachineSetStatus(c client.Client, ms *clusterv1.MachineSet, newStatus
 		if ms.Spec.Replicas != nil {
 			replicas = *ms.Spec.Replicas
 		}
-		klog.V(4).Infof(fmt.Sprintf("Updating status for %v: %s/%s, ", ms.Kind, ms.Namespace, ms.Name) +
+		logger.V(4).Info(fmt.Sprintf("Updating status for %v: %s/%s, ", ms.Kind, ms.Namespace, ms.Name) +
 			fmt.Sprintf("replicas %d->%d (need %d), ", ms.Status.Replicas, newStatus.Replicas, replicas) +
 			fmt.Sprintf("fullyLabeledReplicas %d->%d, ", ms.Status.FullyLabeledReplicas, newStatus.FullyLabeledReplicas) +
 			fmt.Sprintf("readyReplicas %d->%d, ", ms.Status.ReadyReplicas, newStatus.ReadyReplicas) +
@@ -138,23 +139,14 @@ func updateMachineSetStatus(c client.Client, ms *clusterv1.MachineSet, newStatus
 }
 
 func (r *MachineSetReconciler) getMachineNode(cluster *clusterv1.Cluster, machine *clusterv1.Machine) (*corev1.Node, error) {
-	if cluster == nil {
-		// Try to retrieve the Node from the local cluster, if no Cluster reference is found.
-		node := &corev1.Node{}
-		err := r.Client.Get(context.Background(), client.ObjectKey{Name: machine.Status.NodeRef.Name}, node)
-		return node, err
-	}
-
-	// Otherwise, proceed to get the remote cluster client and get the Node.
-	remoteClient, err := remote.NewClusterClient(r.Client, cluster)
+	c, err := remote.NewClusterClient(r.Client, cluster, r.scheme)
 	if err != nil {
 		return nil, err
 	}
-
-	corev1Remote, err := remoteClient.CoreV1()
+	node := &corev1.Node{}
+	err = c.Get(context.TODO(), client.ObjectKey{Name: machine.Status.NodeRef.Name}, node)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "error retrieving node %s for machine %s/%s", machine.Status.NodeRef.Name, machine.Namespace, machine.Name)
 	}
-
-	return corev1Remote.Nodes().Get(machine.Status.NodeRef.Name, metav1.GetOptions{})
+	return node, nil
 }

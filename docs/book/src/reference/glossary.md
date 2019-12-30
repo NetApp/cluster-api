@@ -26,6 +26,34 @@ A temporary cluster that is used to provision a Target Management cluster.
 # C
 ---
 
+### CAPI
+Core Cluster API
+
+### CAPA
+Cluster API Provider AWS
+
+### CABPK
+Cluster API Bootstrap Provider Kubeadm
+
+### CAPD
+Cluster API Provider Docker
+
+### CAPG
+Cluster API Google Cloud Provider
+
+### CAPIBM
+Cluster API Provider IBM Cloud
+
+### CAPO
+Cluster API Provider OpenStack
+
+### CAPV
+Cluster API Provider vSphere
+
+### CAPZ
+Cluster API Provider Azure
+
+
 ### Cluster
 
 A full Kubernetes deployment. See Management Cluster and Workload Cluster
@@ -74,7 +102,7 @@ see [Server](#server)
 
 ### Immutability
 
-A resource that does not mutate.  In kubernetes we often state the instance of a running pod is immutable or does not change once it is run.  In order to make a change, a new pod is run.  In the context of [Cluster API](#cluster-api) we often refer to an running instance of a [Machine](#machine) is considered immutable, from a [Cluster API](#cluster-api) perspective.
+A resource that does not mutate.  In kubernetes we often state the instance of a running pod is immutable or does not change once it is run.  In order to make a change, a new pod is run.  In the context of [Cluster API](#cluster-api) we often refer to a running instance of a [Machine](#machine) as being immutable, from a [Cluster API](#cluster-api) perspective.
 
 # K
 ---
@@ -153,6 +181,11 @@ Existing Cluster API implementations consist of generic and infrastructure provi
 
 Unless otherwise specified, this refers to horizontal scaling.
 
+### Stacked control plane
+
+A control plane node where etcd is colocated with the Kubernetes API server, and
+is running as a static pod.
+
 ### Server
 
 The infrastructure that backs a [Machine Resource](#user-content-machine), typically either a cloud instance, virtual machine, or physical host.
@@ -160,7 +193,7 @@ The infrastructure that backs a [Machine Resource](#user-content-machine), typic
 # T
 ---
 
-### Target Management cluster
+### Target management cluster
 
 The declared cluster we intend to create and manage using cluster-api when running `clusterctl create cluster`.
 
@@ -169,6 +202,4 @@ When running `clusterctl alpha phases pivot` this refers to the cluster that wil
 # W
 ---
 
-### Workload cluster
 
-A cluster whose lifecycle is managed by the Management cluster.

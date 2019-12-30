@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -26,13 +27,12 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/klog"
 	"k8s.io/utils/pointer"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	capierrors "sigs.k8s.io/cluster-api/errors"
 	"sigs.k8s.io/cluster-api/util"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
@@ -41,7 +41,7 @@ var (
 	externalReadyWait = 30 * time.Second
 )
 
-func (r *MachineReconciler) reconcilePhase(ctx context.Context, m *clusterv1.Machine) {
+func (r *MachineReconciler) reconcilePhase(_ context.Context, m *clusterv1.Machine) {
 	// Set the phase to "pending" if nil.
 	if m.Status.Phase == "" {
 		m.Status.SetTypedPhase(clusterv1.MachinePhasePending)
@@ -52,18 +52,18 @@ func (r *MachineReconciler) reconcilePhase(ctx context.Context, m *clusterv1.Mac
 		m.Status.SetTypedPhase(clusterv1.MachinePhaseProvisioning)
 	}
 
-	// Set the phase to "provisioned" if the infrastructure is ready.
-	if m.Status.InfrastructureReady {
+	// Set the phase to "provisioned" if there is a NodeRef.
+	if m.Status.NodeRef != nil {
 		m.Status.SetTypedPhase(clusterv1.MachinePhaseProvisioned)
 	}
 
-	// Set the phase to "running" if there is a NodeRef field.
+	// Set the phase to "running" if there is a NodeRef field and infrastructure is ready.
 	if m.Status.NodeRef != nil && m.Status.InfrastructureReady {
 		m.Status.SetTypedPhase(clusterv1.MachinePhaseRunning)
 	}
 
-	// Set the phase to "failed" if any of Status.ErrorReason or Status.ErrorMessage is not-nil.
-	if m.Status.ErrorReason != nil || m.Status.ErrorMessage != nil {
+	// Set the phase to "failed" if any of Status.FailureReason or Status.FailureMessage is not-nil.
+	if m.Status.FailureReason != nil || m.Status.FailureMessage != nil {
 		m.Status.SetTypedPhase(clusterv1.MachinePhaseFailed)
 	}
 
@@ -75,9 +75,11 @@ func (r *MachineReconciler) reconcilePhase(ctx context.Context, m *clusterv1.Mac
 
 // reconcileExternal handles generic unstructured objects referenced by a Machine.
 func (r *MachineReconciler) reconcileExternal(ctx context.Context, m *clusterv1.Machine, ref *corev1.ObjectReference) (*unstructured.Unstructured, error) {
-	obj, err := external.Get(r.Client, ref, m.Namespace)
+	logger := r.Log.WithValues("machine", m.Name, "namespace", m.Namespace)
+
+	obj, err := external.Get(ctx, r.Client, ref, m.Namespace)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
+		if apierrors.IsNotFound(errors.Cause(err)) {
 			return nil, errors.Wrapf(&capierrors.RequeueAfterError{RequeueAfter: externalReadyWait},
 				"could not find %v %q for Machine %q in namespace %q, requeuing",
 				ref.GroupVersionKind(), ref.Name, m.Name, m.Namespace)
@@ -85,29 +87,40 @@ func (r *MachineReconciler) reconcileExternal(ctx context.Context, m *clusterv1.
 		return nil, err
 	}
 
-	objPatch := client.MergeFrom(obj.DeepCopy())
+	// Initialize the patch helper.
+	patchHelper, err := patch.NewHelper(obj, r.Client)
+	if err != nil {
+		return nil, err
+	}
 
 	// Set external object OwnerReference to the Machine.
-	machineOwnerRef := metav1.OwnerReference{
+	ownerRef := metav1.OwnerReference{
 		APIVersion: clusterv1.GroupVersion.String(),
 		Kind:       "Machine",
 		Name:       m.Name,
 		UID:        m.UID,
 	}
 
-	if !util.HasOwnerRef(obj.GetOwnerReferences(), machineOwnerRef) {
-		obj.SetOwnerReferences(util.EnsureOwnerRef(obj.GetOwnerReferences(), machineOwnerRef))
-		if err := r.Client.Patch(ctx, obj, objPatch); err != nil {
-			return nil, errors.Wrapf(err,
-				"failed to set OwnerReference on %v %q for Machine %q in namespace %q",
-				obj.GroupVersionKind(), ref.Name, m.Name, m.Namespace)
-		}
+	// Add ownerRef to object.
+	obj.SetOwnerReferences(util.EnsureOwnerRef(obj.GetOwnerReferences(), ownerRef))
+
+	// Set the Cluster label.
+	labels := obj.GetLabels()
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	labels[clusterv1.ClusterLabelName] = m.Spec.ClusterName
+	obj.SetLabels(labels)
+
+	// Always attempt to Patch the external object.
+	if err := patchHelper.Patch(ctx, obj); err != nil {
+		return nil, err
 	}
 
 	// Add watcher for external object, if there isn't one already.
 	_, loaded := r.externalWatchers.LoadOrStore(obj.GroupVersionKind().String(), struct{}{})
 	if !loaded && r.controller != nil {
-		klog.Infof("Adding watcher on external object %q", obj.GroupVersionKind())
+		logger.Info("Adding watcher on external object", "gvk", obj.GroupVersionKind())
 		err := r.controller.Watch(
 			&source.Kind{Type: obj},
 			&handler.EnqueueRequestForOwner{OwnerType: &clusterv1.Machine{}},
@@ -118,19 +131,19 @@ func (r *MachineReconciler) reconcileExternal(ctx context.Context, m *clusterv1.
 		}
 	}
 
-	// Set error reason and message, if any.
-	errorReason, errorMessage, err := external.ErrorsFrom(obj)
+	// Set failure reason and message, if any.
+	failureReason, failureMessage, err := external.FailuresFrom(obj)
 	if err != nil {
 		return nil, err
 	}
-	if errorReason != "" {
-		machineStatusError := capierrors.MachineStatusError(errorReason)
-		m.Status.ErrorReason = &machineStatusError
+	if failureReason != "" {
+		machineStatusError := capierrors.MachineStatusError(failureReason)
+		m.Status.FailureReason = &machineStatusError
 	}
-	if errorMessage != "" {
-		m.Status.ErrorMessage = pointer.StringPtr(
+	if failureMessage != "" {
+		m.Status.FailureMessage = pointer.StringPtr(
 			fmt.Sprintf("Failure detected from referenced resource %v with name %q: %s",
-				obj.GroupVersionKind(), obj.GetName(), errorMessage),
+				obj.GroupVersionKind(), obj.GetName(), failureMessage),
 		)
 	}
 
@@ -139,14 +152,6 @@ func (r *MachineReconciler) reconcileExternal(ctx context.Context, m *clusterv1.
 
 // reconcileBootstrap reconciles the Spec.Bootstrap.ConfigRef object on a Machine.
 func (r *MachineReconciler) reconcileBootstrap(ctx context.Context, m *clusterv1.Machine) error {
-	// TODO(vincepri): Move this validation in kubebuilder / webhook.
-	if m.Spec.Bootstrap.ConfigRef == nil && m.Spec.Bootstrap.Data == nil {
-		return errors.Errorf(
-			"Expected at least one of `Bootstrap.ConfigRef` or `Bootstrap.Data` to be populated for Machine %q in namespace %q",
-			m.Name, m.Namespace,
-		)
-	}
-
 	// Call generic external reconciler if we have an external reference.
 	var bootstrapConfig *unstructured.Unstructured
 	if m.Spec.Bootstrap.ConfigRef != nil {
@@ -158,7 +163,7 @@ func (r *MachineReconciler) reconcileBootstrap(ctx context.Context, m *clusterv1
 	}
 
 	// If the bootstrap data is populated, set ready and return.
-	if m.Spec.Bootstrap.Data != nil {
+	if m.Spec.Bootstrap.Data != nil || m.Spec.Bootstrap.DataSecretName != nil {
 		m.Status.BootstrapReady = true
 		return nil
 	}
@@ -177,15 +182,15 @@ func (r *MachineReconciler) reconcileBootstrap(ctx context.Context, m *clusterv1
 			"Bootstrap provider for Machine %q in namespace %q is not ready, requeuing", m.Name, m.Namespace)
 	}
 
-	// Get and set data from the bootstrap provider.
-	data, _, err := unstructured.NestedString(bootstrapConfig.Object, "status", "bootstrapData")
+	// Get and set the name of the secret containing the bootstrap data.
+	secretName, _, err := unstructured.NestedString(bootstrapConfig.Object, "status", "dataSecretName")
 	if err != nil {
-		return errors.Wrapf(err, "failed to retrieve data from bootstrap provider for Machine %q in namespace %q", m.Name, m.Namespace)
-	} else if data == "" {
-		return errors.Errorf("retrieved empty data from bootstrap provider for Machine %q in namespace %q", m.Name, m.Namespace)
+		return errors.Wrapf(err, "failed to retrieve dataSecretName from bootstrap provider for Machine %q in namespace %q", m.Name, m.Namespace)
+	} else if secretName == "" {
+		return errors.Errorf("retrieved empty dataSecretName from bootstrap provider for Machine %q in namespace %q", m.Name, m.Namespace)
 	}
 
-	m.Spec.Bootstrap.Data = pointer.StringPtr(data)
+	m.Spec.Bootstrap.DataSecretName = pointer.StringPtr(secretName)
 	m.Status.BootstrapReady = true
 	return nil
 }
@@ -197,10 +202,17 @@ func (r *MachineReconciler) reconcileInfrastructure(ctx context.Context, m *clus
 	if infraConfig == nil && err == nil {
 		return nil
 	} else if err != nil {
+		if m.Status.InfrastructureReady && strings.Contains(err.Error(), "could not find") {
+			// Infra object went missing after the machine was up and running
+			r.Log.Error(err, "Machine infrastructure reference has been deleted after being ready, setting failure state")
+			m.Status.FailureReason = capierrors.MachineStatusErrorPtr(capierrors.InvalidConfigurationMachineError)
+			m.Status.FailureMessage = pointer.StringPtr(fmt.Sprintf("Machine infrastructure resource %v with name %q has been deleted after being ready",
+				m.Spec.InfrastructureRef.GroupVersionKind(), m.Spec.InfrastructureRef.Name))
+		}
 		return err
 	}
 
-	if m.Status.InfrastructureReady || !infraConfig.GetDeletionTimestamp().IsZero() {
+	if !infraConfig.GetDeletionTimestamp().IsZero() {
 		return nil
 	}
 
@@ -208,7 +220,9 @@ func (r *MachineReconciler) reconcileInfrastructure(ctx context.Context, m *clus
 	ready, err := external.IsReady(infraConfig)
 	if err != nil {
 		return err
-	} else if !ready {
+	}
+	m.Status.InfrastructureReady = ready
+	if !ready {
 		return errors.Wrapf(&capierrors.RequeueAfterError{RequeueAfter: externalReadyWait},
 			"Infrastructure provider for Machine %q in namespace %q is not ready, requeuing", m.Name, m.Namespace,
 		)
@@ -217,21 +231,17 @@ func (r *MachineReconciler) reconcileInfrastructure(ctx context.Context, m *clus
 	// Get Spec.ProviderID from the infrastructure provider.
 	var providerID string
 	if err := util.UnstructuredUnmarshalField(infraConfig, &providerID, "spec", "providerID"); err != nil {
-		return errors.Wrapf(err, "failed to retrieve data from infrastructure provider for Machine %q in namespace %q", m.Name, m.Namespace)
+		return errors.Wrapf(err, "failed to retrieve Spec.ProviderID from infrastructure provider for Machine %q in namespace %q", m.Name, m.Namespace)
 	} else if providerID == "" {
 		return errors.Errorf("retrieved empty Spec.ProviderID from infrastructure provider for Machine %q in namespace %q", m.Name, m.Namespace)
 	}
 
 	// Get and set Status.Addresses from the infrastructure provider.
 	err = util.UnstructuredUnmarshalField(infraConfig, &m.Status.Addresses, "status", "addresses")
-
-	if err != nil {
-		if err != util.ErrUnstructuredFieldNotFound {
-			return errors.Wrapf(err, "failed to retrieve addresses from infrastructure provider for Machine %q in namespace %q", m.Name, m.Namespace)
-		}
+	if err != nil && err != util.ErrUnstructuredFieldNotFound {
+		return errors.Wrapf(err, "failed to retrieve addresses from infrastructure provider for Machine %q in namespace %q", m.Name, m.Namespace)
 	}
 
 	m.Spec.ProviderID = pointer.StringPtr(providerID)
-	m.Status.InfrastructureReady = true
 	return nil
 }

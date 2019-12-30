@@ -21,11 +21,16 @@ set -o pipefail
 REPO_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
 cd "${REPO_ROOT}" || exit 1
 
-# shellcheck source=../hack/ensure-go.sh
+# shellcheck source=./hack/ensure-go.sh
 source "${REPO_ROOT}/hack/ensure-go.sh"
-# shellcheck source=../scripts/fetch_ext_bins.sh
+# shellcheck source=./scripts/fetch_ext_bins.sh
 source ./scripts/fetch_ext_bins.sh
 
 fetch_tools
 setup_envs
-make test
+make generate test
+
+echo "*** Testing Cluster API Provider Docker ***"
+# Docker provider
+cd test/infrastructure/docker
+make generate test

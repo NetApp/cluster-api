@@ -31,6 +31,9 @@ const (
 
 	// MachineControlPlaneLabelName is the label set on machines part of a control plane.
 	MachineControlPlaneLabelName = "cluster.x-k8s.io/control-plane"
+
+	// ExcludeNodeDrainingAnnotation annotation explicitly skips node draining if set
+	ExcludeNodeDrainingAnnotation = "machine.cluster.x-k8s.io.io/exclude-node-draining"
 )
 
 // ANCHOR: MachineSpec
@@ -193,7 +196,6 @@ type Bootstrap struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:path=machines,shortName=ma,scope=Namespaced,categories=cluster-api
 // +kubebuilder:subresource:status
-// +kubebuilder:storageversion
 // +kubebuilder:printcolumn:name="ProviderID",type="string",JSONPath=".spec.providerID",description="Provider ID"
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase",description="Machine status such as Terminating/Pending/Running/Failed etc"
 // +kubebuilder:printcolumn:name="NodeName",type="string",JSONPath=".status.nodeRef.name",description="Node name associated with this machine",priority=1

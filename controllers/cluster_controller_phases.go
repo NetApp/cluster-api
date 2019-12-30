@@ -26,41 +26,35 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/klog"
 	"k8s.io/utils/pointer"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 	"sigs.k8s.io/cluster-api/controllers/external"
 	capierrors "sigs.k8s.io/cluster-api/errors"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/kubeconfig"
+	"sigs.k8s.io/cluster-api/util/patch"
 	"sigs.k8s.io/cluster-api/util/secret"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
-func (r *ClusterReconciler) reconcilePhase(ctx context.Context, cluster *clusterv1.Cluster) {
-	// Set the phase to "pending" if nil.
+func (r *ClusterReconciler) reconcilePhase(_ context.Context, cluster *clusterv1.Cluster) {
 	if cluster.Status.Phase == "" {
 		cluster.Status.SetTypedPhase(clusterv1.ClusterPhasePending)
 	}
 
-	// Set the phase to "provisioning" if the Cluster has an InfrastructureRef object associated.
 	if cluster.Spec.InfrastructureRef != nil {
 		cluster.Status.SetTypedPhase(clusterv1.ClusterPhaseProvisioning)
 	}
 
-	// Set the phase to "provisioned" if the infrastructure is ready.
-	if cluster.Status.InfrastructureReady {
+	if cluster.Status.InfrastructureReady && !cluster.Spec.ControlPlaneEndpoint.IsZero() {
 		cluster.Status.SetTypedPhase(clusterv1.ClusterPhaseProvisioned)
 	}
 
-	// Set the phase to "failed" if any of Status.ErrorReason or Status.ErrorMessage is not-nil.
-	if cluster.Status.ErrorReason != nil || cluster.Status.ErrorMessage != nil {
+	if cluster.Status.FailureReason != nil || cluster.Status.FailureMessage != nil {
 		cluster.Status.SetTypedPhase(clusterv1.ClusterPhaseFailed)
 	}
 
-	// Set the phase to "deleting" if the deletion timestamp is set.
 	if !cluster.DeletionTimestamp.IsZero() {
 		cluster.Status.SetTypedPhase(clusterv1.ClusterPhaseDeleting)
 	}
@@ -68,9 +62,11 @@ func (r *ClusterReconciler) reconcilePhase(ctx context.Context, cluster *cluster
 
 // reconcileExternal handles generic unstructured objects referenced by a Cluster.
 func (r *ClusterReconciler) reconcileExternal(ctx context.Context, cluster *clusterv1.Cluster, ref *corev1.ObjectReference) (*unstructured.Unstructured, error) {
-	obj, err := external.Get(r.Client, ref, cluster.Namespace)
+	logger := r.Log.WithValues("cluster", cluster.Name, "namespace", cluster.Namespace)
+
+	obj, err := external.Get(ctx, r.Client, ref, cluster.Namespace)
 	if err != nil {
-		if apierrors.IsNotFound(err) {
+		if apierrors.IsNotFound(errors.Cause(err)) {
 			return nil, errors.Wrapf(&capierrors.RequeueAfterError{RequeueAfter: 30 * time.Second},
 				"could not find %v %q for Cluster %q in namespace %q, requeuing",
 				ref.GroupVersionKind(), ref.Name, cluster.Name, cluster.Namespace)
@@ -78,7 +74,11 @@ func (r *ClusterReconciler) reconcileExternal(ctx context.Context, cluster *clus
 		return nil, err
 	}
 
-	objPatch := client.MergeFrom(obj.DeepCopy())
+	// Initialize the patch helper.
+	patchHelper, err := patch.NewHelper(obj, r.Client)
+	if err != nil {
+		return nil, err
+	}
 
 	// Set external object OwnerReference to the Cluster.
 	ownerRef := metav1.OwnerReference{
@@ -88,19 +88,26 @@ func (r *ClusterReconciler) reconcileExternal(ctx context.Context, cluster *clus
 		UID:        cluster.UID,
 	}
 
-	if !util.HasOwnerRef(obj.GetOwnerReferences(), ownerRef) {
-		obj.SetOwnerReferences(util.EnsureOwnerRef(obj.GetOwnerReferences(), ownerRef))
-		if err := r.Client.Patch(ctx, obj, objPatch); err != nil {
-			return nil, errors.Wrapf(err,
-				"failed to set OwnerReference on %v %q for Cluster %q in namespace %q",
-				obj.GroupVersionKind(), ref.Name, cluster.Name, cluster.Namespace)
-		}
+	// Add ownerRef to object.
+	obj.SetOwnerReferences(util.EnsureOwnerRef(obj.GetOwnerReferences(), ownerRef))
+
+	// Set the Cluster label.
+	labels := obj.GetLabels()
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	labels[clusterv1.ClusterLabelName] = cluster.Name
+	obj.SetLabels(labels)
+
+	// Always attempt to Patch the external object.
+	if err := patchHelper.Patch(ctx, obj); err != nil {
+		return nil, err
 	}
 
 	// Add watcher for external object, if there isn't one already.
 	_, loaded := r.externalWatchers.LoadOrStore(obj.GroupVersionKind().String(), struct{}{})
 	if !loaded && r.controller != nil {
-		klog.Infof("Adding watcher on external object %q", obj.GroupVersionKind())
+		logger.Info("Adding watcher on external object", "gvk", obj.GroupVersionKind())
 		err := r.controller.Watch(
 			&source.Kind{Type: obj},
 			&handler.EnqueueRequestForOwner{OwnerType: &clusterv1.Cluster{}},
@@ -111,19 +118,19 @@ func (r *ClusterReconciler) reconcileExternal(ctx context.Context, cluster *clus
 		}
 	}
 
-	// Set error reason and message, if any.
-	errorReason, errorMessage, err := external.ErrorsFrom(obj)
+	// Set failure reason and message, if any.
+	failureReason, failureMessage, err := external.FailuresFrom(obj)
 	if err != nil {
 		return nil, err
 	}
-	if errorReason != "" {
-		clusterStatusError := capierrors.ClusterStatusError(errorReason)
-		cluster.Status.ErrorReason = &clusterStatusError
+	if failureReason != "" {
+		clusterStatusError := capierrors.ClusterStatusError(failureReason)
+		cluster.Status.FailureReason = &clusterStatusError
 	}
-	if errorMessage != "" {
-		cluster.Status.ErrorMessage = pointer.StringPtr(
+	if failureMessage != "" {
+		cluster.Status.FailureMessage = pointer.StringPtr(
 			fmt.Sprintf("Failure detected from referenced resource %v with name %q: %s",
-				obj.GroupVersionKind(), obj.GetName(), errorMessage),
+				obj.GroupVersionKind(), obj.GetName(), failureMessage),
 		)
 	}
 
@@ -132,6 +139,8 @@ func (r *ClusterReconciler) reconcileExternal(ctx context.Context, cluster *clus
 
 // reconcileInfrastructure reconciles the Spec.InfrastructureRef object on a Cluster.
 func (r *ClusterReconciler) reconcileInfrastructure(ctx context.Context, cluster *clusterv1.Cluster) error {
+	logger := r.Log.WithValues("cluster", cluster.Name, "namespace", cluster.Namespace)
+
 	if cluster.Spec.InfrastructureRef == nil {
 		return nil
 	}
@@ -148,42 +157,96 @@ func (r *ClusterReconciler) reconcileInfrastructure(ctx context.Context, cluster
 	}
 
 	// Determine if the infrastructure provider is ready.
-	if !cluster.Status.InfrastructureReady {
-		ready, err := external.IsReady(infraConfig)
-		if err != nil {
-			return err
-		} else if !ready {
-			klog.V(3).Infof("Infrastructure provider for Cluster %q in namespace %q is not ready yet", cluster.Name, cluster.Namespace)
-			return nil
-		}
-		cluster.Status.InfrastructureReady = true
+	ready, err := external.IsReady(infraConfig)
+	if err != nil {
+		return err
+	}
+	cluster.Status.InfrastructureReady = ready
+	if !ready {
+		logger.V(3).Info("Infrastructure provider is not ready yet")
+		return nil
 	}
 
 	// Get and parse Status.APIEndpoint field from the infrastructure provider.
-	if len(cluster.Status.APIEndpoints) == 0 {
-		if err := util.UnstructuredUnmarshalField(infraConfig, &cluster.Status.APIEndpoints, "status", "apiEndpoints"); err != nil {
-			return errors.Wrapf(err, "failed to retrieve Status.APIEndpoints from infrastructure provider for Cluster %q in namespace %q",
-				cluster.Name, cluster.Namespace)
-		} else if len(cluster.Status.APIEndpoints) == 0 {
-			return errors.Wrapf(err, "retrieved empty Status.APIEndpoints from infrastructure provider for Cluster %q in namespace %q",
+	if cluster.Spec.ControlPlaneEndpoint.IsZero() {
+		if err := util.UnstructuredUnmarshalField(infraConfig, &cluster.Spec.ControlPlaneEndpoint, "spec", "controlPlaneEndpoint"); err != nil {
+			return errors.Wrapf(err, "failed to retrieve Spec.ControlPlaneEndpoint from infrastructure provider for Cluster %q in namespace %q",
 				cluster.Name, cluster.Namespace)
 		}
+	}
+
+	// Get and parse Status.FailureDomains from the infrastructure provider.
+	if err := util.UnstructuredUnmarshalField(infraConfig, &cluster.Status.FailureDomains, "status", "failureDomains"); err != nil && err != util.ErrUnstructuredFieldNotFound {
+		return errors.Wrapf(err, "failed to retrieve Status.FailureDomains from infrastructure provider for Cluster %q in namespace %q",
+			cluster.Name, cluster.Namespace)
 	}
 
 	return nil
 }
 
+// reconcileControlPlane reconciles the Spec.ControlPlaneRef object on a Cluster.
+func (r *ClusterReconciler) reconcileControlPlane(ctx context.Context, cluster *clusterv1.Cluster) error {
+	if cluster.Spec.ControlPlaneRef == nil {
+		return nil
+	}
+
+	// Call generic external reconciler.
+	controlPlaneConfig, err := r.reconcileExternal(ctx, cluster, cluster.Spec.ControlPlaneRef)
+	if err != nil {
+		return err
+	}
+
+	// There's no need to go any further if the control plane resource is marked for deletion.
+	if !controlPlaneConfig.GetDeletionTimestamp().IsZero() {
+		return nil
+	}
+
+	// Update cluster.Status.ControlPlaneInitialized if it hasn't already been set
+	// Determine if the control plane provider is initialized.
+	if !cluster.Status.ControlPlaneInitialized {
+		initialized, err := external.IsInitialized(controlPlaneConfig)
+		if err != nil {
+			return err
+		}
+		cluster.Status.ControlPlaneInitialized = initialized
+	}
+
+	// Determine if the control plane provider is ready.
+	ready, err := external.IsReady(controlPlaneConfig)
+	if err != nil {
+		return err
+	}
+	cluster.Status.ControlPlaneReady = ready
+
+	return nil
+}
+
 func (r *ClusterReconciler) reconcileKubeconfig(ctx context.Context, cluster *clusterv1.Cluster) error {
-	if len(cluster.Status.APIEndpoints) == 0 {
+	if cluster.Spec.ControlPlaneEndpoint.IsZero() {
+		return nil
+	}
+
+	// Do not generate the Kubeconfig if there is a ControlPlaneRef, since the Control Plane provider is
+	// responsible for the management of the Kubeconfig. We continue to manage it here only for backward
+	// compatibility when a Control Plane provider is not in use.
+	if cluster.Spec.ControlPlaneRef != nil {
 		return nil
 	}
 
 	_, err := secret.Get(r.Client, cluster, secret.Kubeconfig)
 	switch {
 	case apierrors.IsNotFound(err):
-		return kubeconfig.CreateSecret(ctx, r.Client, cluster)
+		if err := kubeconfig.CreateSecret(ctx, r.Client, cluster); err != nil {
+			if err == kubeconfig.ErrDependentCertificateNotFound {
+				return errors.Wrapf(&capierrors.RequeueAfterError{RequeueAfter: 30 * time.Second},
+					"could not find secret %q for Cluster %q in namespace %q, requeuing",
+					secret.ClusterCA, cluster.Name, cluster.Namespace)
+			}
+			return err
+		}
 	case err != nil:
 		return errors.Wrapf(err, "failed to retrieve Kubeconfig Secret for Cluster %q in namespace %q", cluster.Name, cluster.Namespace)
 	}
+
 	return nil
 }

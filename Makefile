@@ -38,11 +38,19 @@ export DOCKER_CLI_EXPERIMENTAL := enabled
 TOOLS_DIR := hack/tools
 TOOLS_BIN_DIR := $(TOOLS_DIR)/bin
 BIN_DIR := bin
+E2E_FRAMEWORK_DIR := test/framework
+RELEASE_NOTES_BIN := bin/release-notes
+RELEASE_NOTES := $(TOOLS_DIR)/$(RELEASE_NOTES_BIN)
 
 # Binaries.
+KUSTOMIZE := $(TOOLS_BIN_DIR)/kustomize
 CONTROLLER_GEN := $(TOOLS_BIN_DIR)/controller-gen
 GOLANGCI_LINT := $(TOOLS_BIN_DIR)/golangci-lint
 CONVERSION_GEN := $(TOOLS_BIN_DIR)/conversion-gen
+
+# Bindata.
+GOBINDATA := $(TOOLS_BIN_DIR)/go-bindata
+GOBINDATA_CLUSTERCTL_DIR := cmd/clusterctl/config
 
 # Define Docker related variables. Releases should modify and double check these vars.
 REGISTRY ?= gcr.io/$(shell gcloud config get-value project)
@@ -54,6 +62,16 @@ TAG ?= dev
 ARCH ?= amd64
 ALL_ARCH = amd64 arm arm64 ppc64le s390x
 
+# Allow overriding the imagePullPolicy
+PULL_POLICY ?= Always
+
+# Hosts running SELinux need :z added to volume mounts
+SELINUX_ENABLED := $(shell cat /sys/fs/selinux/enforce 2> /dev/null || echo 0)
+
+ifeq ($(SELINUX_ENABLED),1)
+  DOCKER_VOL_OPTS?=:z
+endif
+
 all: test manager clusterctl
 
 help:  ## Display this help
@@ -64,24 +82,34 @@ help:  ## Display this help
 ## --------------------------------------
 
 .PHONY: test
-test: generate lint ## Run tests
+test: ## Run tests
 	go test -v ./...
 
 .PHONY: test-integration
 test-integration: ## Run integration tests
 	go test -v -tags=integration ./test/integration/...
 
+.PHONY: test-e2e
+test-e2e: ## Run e2e tests
+	PULL_POLICY=IfNotPresent $(MAKE) docker-build
+	$(MAKE) generate-manifests
+	$(MAKE) release-manifests
+	cd ./test/e2e; MANAGER_IMAGE=$(CONTROLLER_IMG)-$(ARCH):$(TAG) go test -v -tags=e2e -timeout=1h . -args -ginkgo.v -ginkgo.trace
+
 ## --------------------------------------
 ## Binaries
 ## --------------------------------------
 
 .PHONY: manager
-manager: lint-full ## Build manager binary
+manager: ## Build manager binary
 	go build -o $(BIN_DIR)/manager sigs.k8s.io/cluster-api
 
 .PHONY: clusterctl
-clusterctl: lint-full ## Build clusterctl binary
+clusterctl: ## Build clusterctl binary
 	go build -o bin/clusterctl sigs.k8s.io/cluster-api/cmd/clusterctl
+
+$(KUSTOMIZE): $(TOOLS_DIR)/go.mod # Build kustomize from tools folder.
+	cd $(TOOLS_DIR); go build -tags=tools -o $(BIN_DIR)/kustomize sigs.k8s.io/kustomize/kustomize/v3
 
 $(CONTROLLER_GEN): $(TOOLS_DIR)/go.mod # Build controller-gen from tools folder.
 	cd $(TOOLS_DIR); go build -tags=tools -o $(BIN_DIR)/controller-gen sigs.k8s.io/controller-tools/cmd/controller-gen
@@ -92,11 +120,21 @@ $(GOLANGCI_LINT): $(TOOLS_DIR)/go.mod # Build golangci-lint from tools folder.
 $(CONVERSION_GEN): $(TOOLS_DIR)/go.mod
 	cd $(TOOLS_DIR); go build -tags=tools -o $(BIN_DIR)/conversion-gen k8s.io/code-generator/cmd/conversion-gen
 
+$(GOBINDATA): $(TOOLS_DIR)/go.mod # Build go-bindata from tools folder.
+	cd $(TOOLS_DIR); go build -tags=tools -o $(BIN_DIR)/go-bindata github.com/jteeuwen/go-bindata/go-bindata
+
+$(RELEASE_NOTES) : $(TOOLS_DIR)/go.mod
+	cd $(TOOLS_DIR) && go build -tags=tools -o $(RELEASE_NOTES_BIN) ./release
+
+.PHONY: e2e-framework
+e2e-framework: ## Builds the CAPI e2e framework
+	cd $(E2E_FRAMEWORK_DIR); go build ./...
+
 ## --------------------------------------
 ## Linting
 ## --------------------------------------
 
-.PHONY: lint
+.PHONY: lint lint-full
 lint: $(GOLANGCI_LINT) ## Lint codebase
 	$(GOLANGCI_LINT) run -v
 
@@ -111,25 +149,67 @@ lint-full: $(GOLANGCI_LINT) ## Run slower linters to detect possible issues
 generate: $(CONTROLLER_GEN) ## Generate code
 	$(MAKE) generate-manifests
 	$(MAKE) generate-go
+	$(MAKE) generate-bindata
 
 .PHONY: generate-go
 generate-go: $(CONTROLLER_GEN) $(CONVERSION_GEN) ## Runs Go related generate targets
 	$(CONTROLLER_GEN) \
 		object:headerFile=./hack/boilerplate/boilerplate.generatego.txt \
-		paths=./api/...
+		paths=./api/... \
+		paths=./bootstrap/kubeadm/api/... \
+		paths=./controlplane/kubeadm/api/... \
+		paths=./cmd/clusterctl/api/...
 	$(CONVERSION_GEN) \
-    --input-dirs=./api/v1alpha2 \
-    --output-file-base=zz_generated.conversion \
-    --go-header-file=./hack/boilerplate/boilerplate.generatego.txt
+		--input-dirs=./api/v1alpha2 \
+		--output-file-base=zz_generated.conversion \
+		--go-header-file=./hack/boilerplate/boilerplate.generatego.txt
+	$(CONVERSION_GEN) \
+		--input-dirs=./bootstrap/kubeadm/api/v1alpha2 \
+		--output-file-base=zz_generated.conversion \
+		--go-header-file=./hack/boilerplate/boilerplate.generatego.txt
+
+.PHONY: generate-bindata
+generate-bindata: $(KUSTOMIZE) $(GOBINDATA) clean-bindata ## Generate code for embedding the clusterctl api manifest
+	# Package manifest YAML into a single file.
+	mkdir -p $(GOBINDATA_CLUSTERCTL_DIR)/manifest/
+	$(KUSTOMIZE) build $(GOBINDATA_CLUSTERCTL_DIR)/crd > $(GOBINDATA_CLUSTERCTL_DIR)/manifest/clusterctl-api.yaml
+	# Generate go-bindata, add boilerplate, then cleanup.
+	$(GOBINDATA) -pkg=config -o=$(GOBINDATA_CLUSTERCTL_DIR)/crd_manifests.go $(GOBINDATA_CLUSTERCTL_DIR)/manifest/
+	cat ./hack/boilerplate/boilerplate.generatego.txt $(GOBINDATA_CLUSTERCTL_DIR)/crd_manifests.go > $(GOBINDATA_CLUSTERCTL_DIR)/manifest/crd_manifests.go
+	cp $(GOBINDATA_CLUSTERCTL_DIR)/manifest/crd_manifests.go $(GOBINDATA_CLUSTERCTL_DIR)/crd_manifests.go
+	# Cleanup the manifest folder.
+	$(MAKE) clean-bindata
 
 .PHONY: generate-manifests
 generate-manifests: $(CONTROLLER_GEN) ## Generate manifests e.g. CRD, RBAC etc.
 	$(CONTROLLER_GEN) \
 		paths=./api/... \
 		paths=./controllers/... \
-		crd:trivialVersions=true \
+		crd:preserveUnknownFields=false \
 		rbac:roleName=manager-role \
-		output:crd:dir=./config/crd/bases
+		output:crd:dir=./config/crd/bases \
+		output:webhook:dir=./config/webhook \
+		webhook
+	$(CONTROLLER_GEN) \
+		paths=./bootstrap/kubeadm/api/... \
+		paths=./bootstrap/kubeadm/controllers/... \
+		crd:preserveUnknownFields=false \
+		rbac:roleName=bootstrap-manager-role \
+		output:crd:dir=./config/bootstrap/crd/bases \
+		output:rbac:dir=./config/bootstrap/rbac
+	$(CONTROLLER_GEN) \
+		paths=./controlplane/kubeadm/api/... \
+		paths=./controlplane/kubeadm/controllers/... \
+		crd:preserveUnknownFields=false \
+		rbac:roleName=controlplane-manager-role \
+		output:crd:dir=./config/controlplane/crd/bases \
+		output:rbac:dir=./config/controlplane/rbac \
+		output:webhook:dir=./config/controlplane/webhook \
+		webhook
+	$(CONTROLLER_GEN) \
+		paths=./cmd/clusterctl/api/... \
+		crd:trivialVersions=true,preserveUnknownFields=false \
+		output:crd:dir=./cmd/clusterctl/config/crd/bases
 	## Copy files in CI folders.
 	cp -f ./config/rbac/*.yaml ./config/ci/rbac/
 	cp -f ./config/manager/manager*.yaml ./config/ci/manager/
@@ -138,6 +218,8 @@ generate-manifests: $(CONTROLLER_GEN) ## Generate manifests e.g. CRD, RBAC etc.
 modules: ## Runs go mod to ensure modules are up to date.
 	go mod tidy
 	cd $(TOOLS_DIR); go mod tidy
+	cd $(E2E_FRAMEWORK_DIR); go mod tidy
+	cd test/e2e; go mod tidy
 
 ## --------------------------------------
 ## Docker
@@ -147,6 +229,7 @@ modules: ## Runs go mod to ensure modules are up to date.
 docker-build: ## Build the docker image for controller-manager
 	docker build --pull --build-arg ARCH=$(ARCH) . -t $(CONTROLLER_IMG)-$(ARCH):$(TAG)
 	MANIFEST_IMG=$(CONTROLLER_IMG)-$(ARCH) MANIFEST_TAG=$(TAG) $(MAKE) set-manifest-image
+	$(MAKE) set-manifest-pull-policy
 
 .PHONY: docker-push
 docker-push: ## Push the docker image
@@ -176,11 +259,17 @@ docker-push-manifest: ## Push the fat manifest docker image.
 	@for arch in $(ALL_ARCH); do docker manifest annotate --arch $${arch} ${CONTROLLER_IMG}:${TAG} ${CONTROLLER_IMG}-$${arch}:${TAG}; done
 	docker manifest push --purge $(CONTROLLER_IMG):$(TAG)
 	MANIFEST_IMG=$(CONTROLLER_IMG) MANIFEST_TAG=$(TAG) $(MAKE) set-manifest-image
+	$(MAKE) set-manifest-pull-policy
 
 .PHONY: set-manifest-image
 set-manifest-image:
 	$(info Updating kustomize image patch file for manager resource)
-	sed -i'' -e 's@image: .*@image: '"${MANIFEST_IMG}:$(MANIFEST_TAG)"'@' ./config/default/manager_image_patch.yaml
+	sed -i'' -e 's@image: .*@image: '"${MANIFEST_IMG}:$(MANIFEST_TAG)"'@' ./config/core/manager_image_patch.yaml
+
+.PHONY: set-manifest-pull-policy
+set-manifest-pull-policy:
+	$(info Updating kustomize pull policy file for manager resource)
+	sed -i'' -e 's@imagePullPolicy: .*@imagePullPolicy: '"$(PULL_POLICY)"'@' ./config/core/manager_pull_policy.yaml
 
 ## --------------------------------------
 ## Release
@@ -197,18 +286,19 @@ release: clean-release ## Builds and push container images using the latest git 
 	@if [ -z "${RELEASE_TAG}" ]; then echo "RELEASE_TAG is not set"; exit 1; fi
 	@if ! [ -z "$$(git status --porcelain)" ]; then echo "Your local git repository contains uncommitted changes, use git clean before proceeding."; exit 1; fi
 	git checkout "${RELEASE_TAG}"
-	# Push the release image to the staging bucket first.
-	REGISTRY=$(STAGING_REGISTRY) TAG=$(RELEASE_TAG) \
-		$(MAKE) docker-build-all docker-push-all
 	# Set the manifest image to the production bucket.
 	MANIFEST_IMG=$(PROD_REGISTRY)/$(IMAGE_NAME) MANIFEST_TAG=$(RELEASE_TAG) \
 		$(MAKE) set-manifest-image
+	PULL_POLICY=IfNotPresent $(MAKE) set-manifest-pull-policy
 	$(MAKE) release-manifests
 	$(MAKE) release-binaries
 
 .PHONY: release-manifests
 release-manifests: $(RELEASE_DIR) ## Builds the manifests to publish with a release
-	kustomize build config/default > $(RELEASE_DIR)/cluster-api-components.yaml
+	$(KUSTOMIZE) build config/core > $(RELEASE_DIR)/core-components.yaml
+	$(KUSTOMIZE) build config/bootstrap > $(RELEASE_DIR)/bootstrap-components.yaml
+	$(KUSTOMIZE) build config/controlplane > $(RELEASE_DIR)/controlplane-components.yaml
+	$(KUSTOMIZE) build config/default > $(RELEASE_DIR)/cluster-api-components.yaml
 
 release-binaries: ## Builds the binaries to publish with a release
 	RELEASE_BINARY=./cmd/clusterctl GOOS=linux GOARCH=amd64 $(MAKE) release-binary
@@ -220,9 +310,9 @@ release-binary: $(RELEASE_DIR)
 		-e CGO_ENABLED=0 \
 		-e GOOS=$(GOOS) \
 		-e GOARCH=$(GOARCH) \
-		-v "$$(pwd):/workspace" \
+		-v "$$(pwd):/workspace$(DOCKER_VOL_OPTS)" \
 		-w /workspace \
-		golang:1.12.9 \
+		golang:1.13.5 \
 		go build -a -ldflags '-extldflags "-static"' \
 		-o $(RELEASE_DIR)/$(notdir $(RELEASE_BINARY))-$(GOOS)-$(GOARCH) $(RELEASE_BINARY)
 
@@ -230,11 +320,15 @@ release-binary: $(RELEASE_DIR)
 release-staging: ## Builds and push container images to the staging bucket.
 	REGISTRY=$(STAGING_REGISTRY) $(MAKE) docker-build-all docker-push-all release-alias-tag
 
-RELEASE_ALIAS_TAG=$(shell if [ "$(PULL_BASE_REF)" = "master" ]; then echo "latest"; else echo "$(PULL_BASE_REF)"; fi)
+RELEASE_ALIAS_TAG=$(PULL_BASE_REF)
 
 .PHONY: release-alias-tag
 release-alias-tag: # Adds the tag to the last build tag.
 	gcloud container images add-tag $(CONTROLLER_IMG):$(TAG) $(CONTROLLER_IMG):$(RELEASE_ALIAS_TAG)
+
+.PHONY: release-notes
+release-notes:  ## Generates a release notes template to be used with a release.
+	$(RELEASE_NOTES)
 
 ## --------------------------------------
 ## Docker - Example Provider
@@ -265,12 +359,26 @@ clean-bin: ## Remove all generated binaries
 clean-release: ## Remove the release folder
 	rm -rf $(RELEASE_DIR)
 
+.PHONY: clean-book
+clean-book: ## Remove all generated GitBook files
+	rm -rf ./docs/book/_book
+
+.PHONY: clean-bindata
+clean-bindata: ## Remove bindata generated folder
+	rm -rf $(GOBINDATA_CLUSTERCTL_DIR)/manifest
+
+.PHONY: format-tiltfile
+format-tiltfile: ## Format Tiltfile
+	./hack/verify-starlark.sh fix
+
 .PHONY: verify
 verify:
 	./hack/verify-boilerplate.sh
 	./hack/verify-doctoc.sh
-	./hack/verify-generated-files.sh
+	./hack/verify-shellcheck.sh
+	./hack/verify-starlark.sh
 	$(MAKE) verify-modules
+	$(MAKE) verify-gen
 
 .PHONY: verify-modules
 verify-modules: modules
@@ -278,9 +386,11 @@ verify-modules: modules
 		echo "go module files are out of date"; exit 1; \
 	fi
 
-.PHONY: clean-book
-clean-book: ## Remove all generated GitBook files
-	rm -rf ./docs/book/_book
+.PHONY: verify-gen
+verify-gen: generate
+	@if !(git diff --quiet HEAD); then \
+		echo "generated files are out of date, run make generate"; exit 1; \
+	fi
 
 ## --------------------------------------
 ## Others / Utilities

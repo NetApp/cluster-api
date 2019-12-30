@@ -18,7 +18,7 @@ package controllers
 
 import (
 	"context"
-	"reflect"
+	"fmt"
 
 	"github.com/go-logr/logr"
 	"github.com/pkg/errors"
@@ -26,11 +26,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/klog"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -68,17 +67,21 @@ func (r *MachineDeploymentReconciler) SetupWithManager(mgr ctrl.Manager, options
 		WithOptions(options).
 		Complete(r)
 
+	if err != nil {
+		return errors.Wrap(err, "failed setting up with a controller manager")
+	}
+
 	r.recorder = mgr.GetEventRecorderFor("machinedeployment-controller")
-	return err
+	return nil
 }
 
-func (r *MachineDeploymentReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
+func (r *MachineDeploymentReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, reterr error) {
 	ctx := context.Background()
-	_ = r.Log.WithValues("machinedeployment", req.NamespacedName)
+	logger := r.Log.WithValues("machinedeployment", req.Name, "namespace", req.Namespace)
 
-	// Fetch the MachineDeployment instance
-	d := &clusterv1.MachineDeployment{}
-	if err := r.Client.Get(ctx, req.NamespacedName, d); err != nil {
+	// Fetch the MachineDeployment instance.
+	deployment := &clusterv1.MachineDeployment{}
+	if err := r.Client.Get(ctx, req.NamespacedName, deployment); err != nil {
 		if apierrors.IsNotFound(err) {
 			// Object not found, return.  Created objects are automatically garbage collected.
 			// For additional cleanup logic use finalizers.
@@ -88,75 +91,75 @@ func (r *MachineDeploymentReconciler) Reconcile(req ctrl.Request) (ctrl.Result, 
 		return ctrl.Result{}, err
 	}
 
+	// Initialize the patch helper
+	patchHelper, err := patch.NewHelper(deployment, r.Client)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	defer func() {
+		// Always attempt to patch the object and status after each reconciliation.
+		if err := patchHelper.Patch(ctx, deployment); err != nil {
+			if reterr == nil {
+				reterr = err
+			}
+		}
+	}()
+
 	// Ignore deleted MachineDeployments, this can happen when foregroundDeletion
 	// is enabled
-	if d.DeletionTimestamp != nil {
+	if !deployment.DeletionTimestamp.IsZero() {
 		return ctrl.Result{}, nil
 	}
 
-	result, err := r.reconcile(ctx, d)
+	result, err := r.reconcile(ctx, deployment)
 	if err != nil {
-		klog.Errorf("Failed to reconcile MachineDeployment %q: %v", req.NamespacedName, err)
-		r.recorder.Eventf(d, corev1.EventTypeWarning, "ReconcileError", "%v", err)
+		logger.Error(err, "Failed to reconcile MachineDeployment")
+		r.recorder.Eventf(deployment, corev1.EventTypeWarning, "ReconcileError", "%v", err)
 	}
 
 	return result, nil
 }
 
 func (r *MachineDeploymentReconciler) reconcile(ctx context.Context, d *clusterv1.MachineDeployment) (ctrl.Result, error) {
-	clusterv1.PopulateDefaultsMachineDeployment(d)
+	logger := r.Log.WithValues("machinedeployment", d.Name, "namespace", d.Namespace)
+	logger.V(4).Info("Reconcile MachineDeployment")
 
-	// Test for an empty LabelSelector and short circuit if that is the case
-	// TODO: When we have validation webhooks, we should likely reject on an empty LabelSelector
-	everything := metav1.LabelSelector{}
-	if reflect.DeepEqual(d.Spec.Selector, &everything) {
-		if d.Status.ObservedGeneration < d.Generation {
-			patch := client.MergeFrom(d.DeepCopy())
-			d.Status.ObservedGeneration = d.Generation
-			if err := r.Client.Status().Patch(ctx, d, patch); err != nil {
-				klog.Warningf("Failed to patch status for MachineDeployment %q: %v", d.Name, err)
-				return ctrl.Result{}, err
-			}
-		}
-		return ctrl.Result{}, nil
+	// Reconcile and retrieve the Cluster object.
+	if d.Labels == nil {
+		d.Labels = make(map[string]string)
+	}
+	if d.Spec.Selector.MatchLabels == nil {
+		d.Spec.Selector.MatchLabels = make(map[string]string)
+	}
+	if d.Spec.Template.Labels == nil {
+		d.Spec.Template.Labels = make(map[string]string)
 	}
 
-	// Make sure that label selector can match the template's labels.
-	// TODO(vincepri): Move to a validation (admission) webhook when supported.
-	selector, err := metav1.LabelSelectorAsSelector(&d.Spec.Selector)
+	d.Labels[clusterv1.ClusterLabelName] = d.Spec.ClusterName
+
+	// Make sure selector and template to be in the same cluster.
+	d.Spec.Selector.MatchLabels[clusterv1.ClusterLabelName] = d.Spec.ClusterName
+	d.Spec.Template.Labels[clusterv1.ClusterLabelName] = d.Spec.ClusterName
+
+	// Add label and selector based on the MachineDeployment's name.
+	d.Spec.Selector.MatchLabels[clusterv1.MachineDeploymentLabelName] = d.Name
+	d.Spec.Template.Labels[clusterv1.MachineDeploymentLabelName] = d.Name
+
+	// Check for Cluster ownership.
+	cluster, err := util.GetClusterByName(ctx, r.Client, d.ObjectMeta.Namespace, d.Spec.ClusterName)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrapf(err, "failed to parse MachineDeployment %q label selector", d.Name)
-	}
-
-	if !selector.Matches(labels.Set(d.Spec.Template.Labels)) {
-		return ctrl.Result{}, errors.Errorf("failed validation on MachineDeployment %q label selector, cannot match Machine template labels", d.Name)
-	}
-
-	// Copy label selector to its status counterpart in string format.
-	// This is necessary for CRDs including scale subresources.
-	d.Status.Selector = selector.String()
-
-	// Cluster might be nil as some providers might not require a cluster object
-	// for machine management.
-	cluster, err := util.GetClusterFromMetadata(ctx, r.Client, d.ObjectMeta)
-	if errors.Cause(err) == util.ErrNoCluster {
-		klog.V(2).Infof("MachineDeployment %q in namespace %q doesn't specify %q label, assuming nil Cluster", d.Name, d.Namespace, clusterv1.MachineClusterLabelName)
-	} else if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	if cluster != nil && r.shouldAdopt(d) {
-		patch := client.MergeFrom(d.DeepCopy())
+	if r.shouldAdopt(d) {
 		d.OwnerReferences = util.EnsureOwnerRef(d.OwnerReferences, metav1.OwnerReference{
-			APIVersion: cluster.APIVersion,
-			Kind:       cluster.Kind,
+			APIVersion: clusterv1.GroupVersion.String(),
+			Kind:       "Cluster",
 			Name:       cluster.Name,
 			UID:        cluster.UID,
 		})
-		// Patch using a deep copy to avoid overwriting any unexpected Status changes from the returned result
-		if err := r.Client.Patch(ctx, d.DeepCopy(), patch); err != nil {
-			return ctrl.Result{}, errors.Wrapf(err, "Failed to add OwnerReference to MachineDeployment %s/%s", d.Namespace, d.Name)
-		}
+		return ctrl.Result{}, nil
 	}
 
 	msList, err := r.getMachineSetsForDeployment(d)
@@ -164,18 +167,12 @@ func (r *MachineDeploymentReconciler) reconcile(ctx context.Context, d *clusterv
 		return ctrl.Result{}, err
 	}
 
-	machineMap, err := r.getMachineMapForDeployment(d, msList)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
 	if d.Spec.Paused {
-		return ctrl.Result{}, r.sync(d, msList, machineMap)
+		return ctrl.Result{}, r.sync(d, msList)
 	}
 
-	switch d.Spec.Strategy.Type {
-	case clusterv1.RollingUpdateMachineDeploymentStrategyType:
-		return ctrl.Result{}, r.rolloutRolling(d, msList, machineMap)
+	if d.Spec.Strategy.Type == clusterv1.RollingUpdateMachineDeploymentStrategyType {
+		return ctrl.Result{}, r.rolloutRolling(d, msList)
 	}
 
 	return ctrl.Result{}, errors.Errorf("unexpected deployment strategy type: %s", d.Spec.Strategy.Type)
@@ -183,6 +180,8 @@ func (r *MachineDeploymentReconciler) reconcile(ctx context.Context, d *clusterv
 
 // getMachineSetsForDeployment returns a list of MachineSets associated with a MachineDeployment.
 func (r *MachineDeploymentReconciler) getMachineSetsForDeployment(d *clusterv1.MachineDeployment) ([]*clusterv1.MachineSet, error) {
+	logger := r.Log.WithValues("machinedeployemnt", d.Name, "namespace", d.Namespace)
+
 	// List all MachineSets to find those we own but that no longer match our selector.
 	machineSets := &clusterv1.MachineSetList{}
 	if err := r.Client.List(context.Background(), machineSets, client.InNamespace(d.Namespace)); err != nil {
@@ -195,19 +194,19 @@ func (r *MachineDeploymentReconciler) getMachineSetsForDeployment(d *clusterv1.M
 
 		selector, err := metav1.LabelSelectorAsSelector(&d.Spec.Selector)
 		if err != nil {
-			klog.Errorf("Skipping MachineSet %q, failed to get label selector from spec selector: %v", ms.Name, err)
+			logger.Error(err, "Skipping MachineSet, failed to get label selector from spec selector", "machineset", ms.Name)
 			continue
 		}
 
 		// If a MachineDeployment with a nil or empty selector creeps in, it should match nothing, not everything.
 		if selector.Empty() {
-			klog.Warningf("Skipping MachineSet %q as the selector is empty", ms.Name)
+			logger.Info("Skipping MachineSet as the selector is empty", "machineset", ms.Name)
 			continue
 		}
 
 		// Skip this MachineSet unless either selector matches or it has a controller ref pointing to this MachineDeployment
 		if !selector.Matches(labels.Set(ms.Labels)) && !metav1.IsControlledBy(ms, d) {
-			klog.V(4).Infof("Skipping MachineSet %v, label mismatch", ms.Name)
+			logger.V(4).Info("Skipping MachineSet, label mismatch", "machineset", ms.Name)
 			continue
 		}
 
@@ -215,7 +214,7 @@ func (r *MachineDeploymentReconciler) getMachineSetsForDeployment(d *clusterv1.M
 		if metav1.GetControllerOf(ms) == nil {
 			if err := r.adoptOrphan(d, ms); err != nil {
 				r.recorder.Eventf(d, corev1.EventTypeWarning, "FailedAdopt", "Failed to adopt MachineSet %q: %v", ms.Name, err)
-				klog.Warningf("Failed to adopt MachineSet %q into MachineDeployment %q: %v", ms.Name, d.Name, err)
+				logger.Error(err, "Failed to adopt MachineSet into MachineDeployment", "machineset", ms.Name)
 				continue
 			}
 			r.recorder.Eventf(d, corev1.EventTypeNormal, "SuccessfulAdopt", "Adopted MachineSet %q", ms.Name)
@@ -239,60 +238,18 @@ func (r *MachineDeploymentReconciler) adoptOrphan(deployment *clusterv1.MachineD
 	return r.Client.Patch(context.Background(), machineSet, patch)
 }
 
-// getMachineMapForDeployment returns the Machines managed by a Deployment.
-//
-// It returns a map from MachineSet UID to a list of Machines controlled by that MachineSet,
-// according to the Machine's ControllerRef.
-func (r *MachineDeploymentReconciler) getMachineMapForDeployment(d *clusterv1.MachineDeployment, msList []*clusterv1.MachineSet) (map[types.UID]*clusterv1.MachineList, error) {
-	// TODO(droot): double check if previous selector maps correctly to new one.
-	// _, err := metav1.LabelSelectorAsSelector(&d.Spec.Selector)
-
-	// Get all Machines that potentially belong to this Deployment.
-	selector, err := metav1.LabelSelectorAsMap(&d.Spec.Selector)
-	if err != nil {
-		return nil, err
-	}
-
-	machines := &clusterv1.MachineList{}
-	if err = r.Client.List(context.Background(), machines, client.InNamespace(d.Namespace), client.MatchingLabels(selector)); err != nil {
-		return nil, err
-	}
-
-	// Group Machines by their controller (if it's in msList).
-	machineMap := make(map[types.UID]*clusterv1.MachineList, len(msList))
-	for _, ms := range msList {
-		machineMap[ms.UID] = &clusterv1.MachineList{}
-	}
-
-	for idx := range machines.Items {
-		machine := &machines.Items[idx]
-
-		// Do not ignore inactive Machines because Recreate Deployments need to verify that no
-		// Machines from older versions are running before spinning up new Machines.
-		controllerRef := metav1.GetControllerOf(machine)
-		if controllerRef == nil {
-			continue
-		}
-
-		// Only append if we care about this UID.
-		if machineList, ok := machineMap[controllerRef.UID]; ok {
-			machineList.Items = append(machineList.Items, *machine)
-		}
-	}
-
-	return machineMap, nil
-}
-
 // getMachineDeploymentsForMachineSet returns a list of MachineDeployments that could potentially match a MachineSet.
 func (r *MachineDeploymentReconciler) getMachineDeploymentsForMachineSet(ms *clusterv1.MachineSet) []*clusterv1.MachineDeployment {
+	logger := r.Log.WithValues("machineset", ms.Name, "namespace", ms.Namespace)
+
 	if len(ms.Labels) == 0 {
-		klog.Warningf("No MachineDeployments found for MachineSet %q because it has no labels", ms.Name)
+		logger.Info("No MachineDeployments found for MachineSet because it has no labels", "machineset", ms.Name)
 		return nil
 	}
 
 	dList := &clusterv1.MachineDeploymentList{}
 	if err := r.Client.List(context.Background(), dList, client.InNamespace(ms.Namespace)); err != nil {
-		klog.Warningf("Failed to list MachineDeployments: %v", err)
+		logger.Error(err, "Failed to list MachineDeployments")
 		return nil
 	}
 
@@ -321,7 +278,7 @@ func (r *MachineDeploymentReconciler) MachineSetToDeployments(o handler.MapObjec
 
 	ms, ok := o.Object.(*clusterv1.MachineSet)
 	if !ok {
-		klog.Errorf("Expected a MachineSet but got %T instead: %v", o.Object, o.Object)
+		r.Log.Error(nil, fmt.Sprintf("Expected a MachineSet but got a %T", o.Object))
 		return nil
 	}
 
@@ -335,7 +292,7 @@ func (r *MachineDeploymentReconciler) MachineSetToDeployments(o handler.MapObjec
 
 	mds := r.getMachineDeploymentsForMachineSet(ms)
 	if len(mds) == 0 {
-		klog.V(4).Infof("Found no MachineDeployment for MachineSet: %v", ms.Name)
+		r.Log.V(4).Info("Found no MachineDeployment for MachineSet", "machineset", ms.Name)
 		return nil
 	}
 

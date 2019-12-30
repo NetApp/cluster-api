@@ -17,14 +17,28 @@ limitations under the License.
 package kubeconfig
 
 import (
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
-	"sigs.k8s.io/cluster-api/util/secret"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/clientcmd/api"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
+	"sigs.k8s.io/cluster-api/util/certs"
+	"sigs.k8s.io/cluster-api/util/secret"
 )
 
 var (
@@ -53,6 +67,7 @@ users:
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "test1-kubeconfig",
 			Namespace: "test",
+			Labels:    map[string]string{clusterv1.ClusterLabelName: "test1"},
 		},
 		Data: map[string][]byte{
 			secret.KubeconfigDataName: []byte(validKubeConfig),
@@ -60,8 +75,16 @@ users:
 	}
 )
 
+func setupScheme() *runtime.Scheme {
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		panic(err)
+	}
+	return scheme
+}
+
 func TestGetKubeConfigSecret(t *testing.T) {
-	client := fake.NewFakeClient(validSecret)
+	client := fake.NewFakeClientWithScheme(setupScheme(), validSecret)
 	found, err := FromSecret(client, &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test1", Namespace: "test"},
 	})
@@ -72,4 +95,277 @@ func TestGetKubeConfigSecret(t *testing.T) {
 	if !reflect.DeepEqual(validSecret.Data[secret.KubeconfigDataName], found) {
 		t.Fatalf("Expected found secret to be equal to input")
 	}
+}
+
+func getTestCACert(key *rsa.PrivateKey) (*x509.Certificate, error) {
+	cfg := certs.Config{
+		CommonName: "kubernetes",
+	}
+
+	now := time.Now().UTC()
+
+	tmpl := x509.Certificate{
+		SerialNumber: new(big.Int).SetInt64(0),
+		Subject: pkix.Name{
+			CommonName:   cfg.CommonName,
+			Organization: cfg.Organization,
+		},
+		NotBefore:             now.Add(time.Minute * -5),
+		NotAfter:              now.Add(time.Hour * 24), // 1 day
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		MaxPathLenZero:        true,
+		BasicConstraintsValid: true,
+		MaxPathLen:            0,
+		IsCA:                  true,
+	}
+
+	b, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, key.Public(), key)
+	if err != nil {
+		return nil, err
+	}
+
+	c, err := x509.ParseCertificate(b)
+	return c, err
+}
+
+func TestNew(t *testing.T) {
+	testCases := []struct {
+		cluster        string
+		endpoint       string
+		expectedConfig api.Config
+		expectError    bool
+	}{
+		{
+			cluster:  "foo",
+			endpoint: "https://127:0.0.1:4003",
+			expectedConfig: api.Config{
+				Clusters: map[string]*api.Cluster{
+					"foo": {
+						Server: "https://127:0.0.1:4003",
+					},
+				},
+				Contexts: map[string]*api.Context{
+					"foo-admin@foo": {
+						Cluster:  "foo",
+						AuthInfo: "foo-admin",
+					},
+				},
+				CurrentContext: "foo-admin@foo",
+			},
+			expectError: false,
+		},
+	}
+
+	for _, tc := range testCases {
+		caKey, err := certs.NewPrivateKey()
+		if err != nil {
+			t.Fatalf("Failed to generate private key for ca cert, %v", err)
+		}
+
+		caCert, err := getTestCACert(caKey)
+		if err != nil {
+			t.Fatalf("Failed to generate test ca cert, %v", err)
+		}
+
+		actualConfig, actualError := New(tc.cluster, tc.endpoint, caCert, caKey)
+		if tc.expectError {
+			if actualError == nil {
+				t.Fatalf("Expected error but go nil error")
+			} else {
+				continue
+			}
+		}
+
+		if len(actualConfig.Clusters) != len(tc.expectedConfig.Clusters) {
+			t.Fatalf("Unexpected number of clusters in generated kubeconfig, Want: %d, Got: %d",
+				len(tc.expectedConfig.Clusters), len(actualConfig.Clusters))
+		}
+		if len(actualConfig.Contexts) != len(tc.expectedConfig.Contexts) {
+			t.Fatalf("Unexpected number of contexts in generated kubeconfig, Want: %d, Got: %d",
+				len(tc.expectedConfig.Contexts), len(actualConfig.Contexts))
+		}
+		if _, found := actualConfig.Clusters[tc.cluster]; !found {
+			t.Fatalf("Cluster %q not found in generated kubeconfig", tc.cluster)
+		}
+		if _, found := actualConfig.Contexts[tc.expectedConfig.CurrentContext]; !found {
+			t.Fatalf("Context %q not found in generated kubeconfig", tc.expectedConfig.CurrentContext)
+		}
+		if actualConfig.CurrentContext != tc.expectedConfig.CurrentContext {
+			t.Fatalf("Unexpected value for current config in generated kubeconfig, Want: %q, Got :%q",
+				tc.expectedConfig.CurrentContext, actualConfig.CurrentContext)
+		}
+		if actualConfig.Contexts[tc.expectedConfig.CurrentContext].AuthInfo != tc.expectedConfig.Contexts[tc.expectedConfig.CurrentContext].AuthInfo {
+			t.Fatalf("Unexpected AuthInfo in context for cluter %q in generated kubeconfig, Want: %q, Got: %q",
+				tc.cluster, tc.expectedConfig.Contexts[tc.expectedConfig.CurrentContext].AuthInfo,
+				actualConfig.Contexts[tc.expectedConfig.CurrentContext].AuthInfo)
+		}
+	}
+}
+
+func TestGenerateSecretWithOwner(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	owner := metav1.OwnerReference{
+		Name:       "test1",
+		Kind:       "Cluster",
+		APIVersion: clusterv1.GroupVersion.String(),
+	}
+
+	expectedSecret := validSecret.DeepCopy()
+	expectedSecret.SetOwnerReferences([]metav1.OwnerReference{owner})
+
+	kubeconfigSecret := GenerateSecretWithOwner(
+		client.ObjectKey{
+			Name:      "test1",
+			Namespace: "test",
+		},
+		[]byte(validKubeConfig),
+		owner,
+	)
+
+	g.Expect(kubeconfigSecret).NotTo(gomega.BeNil())
+	g.Expect(kubeconfigSecret).To(gomega.Equal(expectedSecret))
+}
+
+func TestGenerateSecret(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	expectedSecret := validSecret.DeepCopy()
+	expectedSecret.SetOwnerReferences(
+		[]metav1.OwnerReference{
+			{
+				Name:       "test1",
+				Kind:       "Cluster",
+				APIVersion: clusterv1.GroupVersion.String(),
+			},
+		},
+	)
+
+	cluster := &clusterv1.Cluster{}
+	cluster.SetNamespace("test")
+	cluster.SetName("test1")
+
+	kubeconfigSecret := GenerateSecret(
+		cluster,
+		[]byte(validKubeConfig),
+	)
+
+	g.Expect(kubeconfigSecret).NotTo(gomega.BeNil())
+	g.Expect(kubeconfigSecret).To(gomega.Equal(expectedSecret))
+}
+
+func TestCreateSecretWithOwner(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	caKey, err := certs.NewPrivateKey()
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	caCert, err := getTestCACert(caKey)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test1-ca",
+			Namespace: "test",
+		},
+		Data: map[string][]byte{
+			secret.TLSKeyDataName: certs.EncodePrivateKeyPEM(caKey),
+			secret.TLSCrtDataName: certs.EncodeCertPEM(caCert),
+		},
+	}
+
+	c := fake.NewFakeClientWithScheme(setupScheme(), caSecret)
+
+	owner := metav1.OwnerReference{
+		Name:       "test1",
+		Kind:       "Cluster",
+		APIVersion: clusterv1.GroupVersion.String(),
+	}
+
+	err = CreateSecretWithOwner(
+		context.Background(),
+		c,
+		client.ObjectKey{
+			Name:      "test1",
+			Namespace: "test",
+		},
+		"localhost:6443",
+		owner,
+	)
+
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	s := &corev1.Secret{}
+	key := client.ObjectKey{Name: "test1-kubeconfig", Namespace: "test"}
+	g.Expect(c.Get(context.Background(), key, s)).To(gomega.Succeed())
+	g.Expect(s.OwnerReferences).To(gomega.ContainElement(owner))
+
+	clientConfig, err := clientcmd.NewClientConfigFromBytes(s.Data[secret.KubeconfigDataName])
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	restClient, err := clientConfig.ClientConfig()
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(restClient.CAData).To(gomega.Equal(certs.EncodeCertPEM(caCert)))
+	g.Expect(restClient.Host).To(gomega.Equal("https://localhost:6443"))
+}
+
+func TestCreateSecret(t *testing.T) {
+	g := gomega.NewWithT(t)
+
+	caKey, err := certs.NewPrivateKey()
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	caCert, err := getTestCACert(caKey)
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test1-ca",
+			Namespace: "test",
+		},
+		Data: map[string][]byte{
+			secret.TLSKeyDataName: certs.EncodePrivateKeyPEM(caKey),
+			secret.TLSCrtDataName: certs.EncodeCertPEM(caCert),
+		},
+	}
+
+	c := fake.NewFakeClientWithScheme(setupScheme(), caSecret)
+
+	cluster := &clusterv1.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test1",
+			Namespace: "test",
+		},
+		Spec: clusterv1.ClusterSpec{
+			ControlPlaneEndpoint: clusterv1.APIEndpoint{
+				Host: "localhost",
+				Port: 8443,
+			},
+		},
+	}
+
+	err = CreateSecret(
+		context.Background(),
+		c,
+		cluster,
+	)
+
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+
+	s := &corev1.Secret{}
+	key := client.ObjectKey{Name: "test1-kubeconfig", Namespace: "test"}
+	g.Expect(c.Get(context.Background(), key, s)).To(gomega.Succeed())
+	g.Expect(s.OwnerReferences).To(gomega.ContainElement(
+		metav1.OwnerReference{
+			Name:       cluster.Name,
+			Kind:       "Cluster",
+			APIVersion: clusterv1.GroupVersion.String(),
+		},
+	))
+
+	clientConfig, err := clientcmd.NewClientConfigFromBytes(s.Data[secret.KubeconfigDataName])
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	restClient, err := clientConfig.ClientConfig()
+	g.Expect(err).NotTo(gomega.HaveOccurred())
+	g.Expect(restClient.CAData).To(gomega.Equal(certs.EncodeCertPEM(caCert)))
+	g.Expect(restClient.Host).To(gomega.Equal("https://localhost:8443"))
 }

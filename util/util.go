@@ -34,9 +34,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -52,13 +51,9 @@ const (
 
 var (
 	rnd                          = rand.New(rand.NewSource(time.Now().UnixNano()))
-	ErrNoCluster                 = fmt.Errorf("no %q label present", clusterv1.MachineClusterLabelName)
+	ErrNoCluster                 = fmt.Errorf("no %q label present", clusterv1.ClusterLabelName)
 	ErrUnstructuredFieldNotFound = fmt.Errorf("field not found")
 )
-
-func init() {
-	clusterv1.AddToScheme(scheme.Scheme)
-}
 
 // RandomToken returns a random token.
 func RandomToken() string {
@@ -86,7 +81,8 @@ func GetControlPlaneMachines(machines []*clusterv1.Machine) (res []*clusterv1.Ma
 
 // GetControlPlaneMachinesFromList returns a slice containing control plane machines.
 func GetControlPlaneMachinesFromList(machineList *clusterv1.MachineList) (res []*clusterv1.Machine) {
-	for _, machine := range machineList.Items {
+	for i := 0; i < len(machineList.Items); i++ {
+		machine := machineList.Items[i]
 		if IsControlPlaneMachine(&machine) {
 			res = append(res, &machine)
 		}
@@ -142,7 +138,8 @@ func GetMachineIfExists(c client.Client, namespace, name string) (*clusterv1.Mac
 
 // IsControlPlaneMachine checks machine is a control plane node.
 func IsControlPlaneMachine(machine *clusterv1.Machine) bool {
-	return machine.ObjectMeta.Labels[clusterv1.MachineControlPlaneLabelName] != ""
+	_, ok := machine.ObjectMeta.Labels[clusterv1.MachineControlPlaneLabelName]
+	return ok
 }
 
 // IsNodeReady returns true if a node is ready.
@@ -158,10 +155,10 @@ func IsNodeReady(node *v1.Node) bool {
 
 // GetClusterFromMetadata returns the Cluster object (if present) using the object metadata.
 func GetClusterFromMetadata(ctx context.Context, c client.Client, obj metav1.ObjectMeta) (*clusterv1.Cluster, error) {
-	if obj.Labels[clusterv1.MachineClusterLabelName] == "" {
+	if obj.Labels[clusterv1.ClusterLabelName] == "" {
 		return nil, errors.WithStack(ErrNoCluster)
 	}
-	return GetClusterByName(ctx, c, obj.Namespace, obj.Labels[clusterv1.MachineClusterLabelName])
+	return GetClusterByName(ctx, c, obj.Namespace, obj.Labels[clusterv1.ClusterLabelName])
 }
 
 // GetOwnerCluster returns the Cluster object owning the current resource.

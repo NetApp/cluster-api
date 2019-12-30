@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -27,14 +28,19 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha2"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1alpha3"
 	"sigs.k8s.io/cluster-api/controllers/external"
+	"sigs.k8s.io/cluster-api/controllers/metrics"
 	"sigs.k8s.io/cluster-api/controllers/remote"
 	capierrors "sigs.k8s.io/cluster-api/errors"
+	kubedrain "sigs.k8s.io/cluster-api/third_party/kubernetes-drain"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/patch"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -59,25 +65,32 @@ type MachineReconciler struct {
 	Client client.Client
 	Log    logr.Logger
 
+	config           *rest.Config
 	controller       controller.Controller
 	recorder         record.EventRecorder
 	externalWatchers sync.Map
+	scheme           *runtime.Scheme
 }
 
 func (r *MachineReconciler) SetupWithManager(mgr ctrl.Manager, options controller.Options) error {
-	c, err := ctrl.NewControllerManagedBy(mgr).
+	controller, err := ctrl.NewControllerManagedBy(mgr).
 		For(&clusterv1.Machine{}).
 		WithOptions(options).
 		Build(r)
 
-	r.controller = c
+	if err != nil {
+		return errors.Wrap(err, "failed setting up with a controller manager")
+	}
+
+	r.controller = controller
 	r.recorder = mgr.GetEventRecorderFor("machine-controller")
-	return err
+	r.config = mgr.GetConfig()
+	r.scheme = mgr.GetScheme()
+	return nil
 }
 
 func (r *MachineReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, reterr error) {
 	ctx := context.Background()
-	_ = r.Log.WithValues("machine", req.NamespacedName)
 
 	// Fetch the Machine instance
 	m := &clusterv1.Machine{}
@@ -99,10 +112,10 @@ func (r *MachineReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, reterr e
 	}
 
 	defer func() {
-		// Always reconcile the Status.Phase field.
 		r.reconcilePhase(ctx, m)
+		r.reconcileMetrics(ctx, m)
 
-		// Always attempt to Patch the Machine object and status after each reconciliation.
+		// Always attempt to patch the object and status after each reconciliation.
 		if err := patchHelper.Patch(ctx, m); err != nil {
 			if reterr == nil {
 				reterr = err
@@ -110,15 +123,16 @@ func (r *MachineReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, reterr e
 		}
 	}()
 
-	// Cluster might be nil as some providers might not require a cluster object
-	// for machine management.
-	cluster, err := util.GetClusterFromMetadata(ctx, r.Client, m.ObjectMeta)
-	if errors.Cause(err) == util.ErrNoCluster {
-		klog.V(2).Infof("Machine %q in namespace %q doesn't specify %q label, assuming nil cluster",
-			m.Name, m.Namespace, clusterv1.MachineClusterLabelName)
-	} else if err != nil {
+	// Reconcile and retrieve the Cluster object.
+	if m.Labels == nil {
+		m.Labels = make(map[string]string)
+	}
+	m.Labels[clusterv1.ClusterLabelName] = m.Spec.ClusterName
+
+	cluster, err := util.GetClusterByName(ctx, r.Client, m.ObjectMeta.Namespace, m.Spec.ClusterName)
+	if err != nil {
 		return ctrl.Result{}, errors.Wrapf(err, "failed to get cluster %q for machine %q in namespace %q",
-			m.Labels[clusterv1.MachineClusterLabelName], m.Name, m.Namespace)
+			m.Labels[clusterv1.ClusterLabelName], m.Name, m.Namespace)
 	}
 
 	// Handle deletion reconciliation loop.
@@ -131,11 +145,14 @@ func (r *MachineReconciler) Reconcile(req ctrl.Request) (_ ctrl.Result, reterr e
 }
 
 func (r *MachineReconciler) reconcile(ctx context.Context, cluster *clusterv1.Cluster, m *clusterv1.Machine) (ctrl.Result, error) {
+	logger := r.Log.WithValues("machine", m.Name, "namespace", m.Namespace)
+	logger = logger.WithValues("cluster", cluster.Name)
+
 	// If the Machine belongs to a cluster, add an owner reference.
-	if cluster != nil && r.shouldAdopt(m) {
+	if r.shouldAdopt(m) {
 		m.OwnerReferences = util.EnsureOwnerRef(m.OwnerReferences, metav1.OwnerReference{
-			APIVersion: cluster.APIVersion,
-			Kind:       cluster.Kind,
+			APIVersion: clusterv1.GroupVersion.String(),
+			Kind:       "Cluster",
 			Name:       cluster.Name,
 			UID:        cluster.UID,
 		})
@@ -143,7 +160,7 @@ func (r *MachineReconciler) reconcile(ctx context.Context, cluster *clusterv1.Cl
 
 	// If the Machine doesn't have a finalizer, add one.
 	if !util.Contains(m.Finalizers, clusterv1.MachineFinalizer) {
-		m.Finalizers = append(m.ObjectMeta.Finalizers, clusterv1.MachineFinalizer)
+		m.Finalizers = append(m.Finalizers, clusterv1.MachineFinalizer)
 	}
 
 	// Call the inner reconciliation methods.
@@ -162,7 +179,7 @@ func (r *MachineReconciler) reconcile(ctx context.Context, cluster *clusterv1.Cl
 			if !res.Requeue {
 				res.Requeue = true
 				res.RequeueAfter = requeueErr.GetRequeueAfter()
-				klog.Infof("Reconciliation for Machine %q in namespace %q asked to requeue: %v", m.Name, m.Namespace, err)
+				logger.Error(err, "Reconciliation for Machine asked to requeue")
 			}
 			continue
 		}
@@ -172,19 +189,49 @@ func (r *MachineReconciler) reconcile(ctx context.Context, cluster *clusterv1.Cl
 	return res, kerrors.NewAggregate(errs)
 }
 
+func (r *MachineReconciler) reconcileMetrics(_ context.Context, m *clusterv1.Machine) {
+	if m.Status.BootstrapReady {
+		metrics.MachineBootstrapReady.WithLabelValues(m.Name, m.Namespace, m.Spec.ClusterName).Set(1)
+	} else {
+		metrics.MachineBootstrapReady.WithLabelValues(m.Name, m.Namespace, m.Spec.ClusterName).Set(0)
+	}
+	if m.Status.InfrastructureReady {
+		metrics.MachineInfrastructureReady.WithLabelValues(m.Name, m.Namespace, m.Spec.ClusterName).Set(1)
+	} else {
+		metrics.MachineInfrastructureReady.WithLabelValues(m.Name, m.Namespace, m.Spec.ClusterName).Set(0)
+	}
+	if m.Status.NodeRef != nil {
+		metrics.MachineNodeReady.WithLabelValues(m.Name, m.Namespace, m.Spec.ClusterName).Set(1)
+	} else {
+		metrics.MachineNodeReady.WithLabelValues(m.Name, m.Namespace, m.Spec.ClusterName).Set(0)
+	}
+}
+
 func (r *MachineReconciler) reconcileDelete(ctx context.Context, cluster *clusterv1.Cluster, m *clusterv1.Machine) (ctrl.Result, error) {
+	logger := r.Log.WithValues("machine", m.Name, "namespace", m.Namespace)
+	logger = logger.WithValues("cluster", cluster.Name)
+
 	if err := r.isDeleteNodeAllowed(ctx, m); err != nil {
 		switch err {
 		case errNilNodeRef:
-			klog.V(2).Infof("Deleting node is not allowed for machine %q: %v", m.Name, err)
+			logger.Error(err, "Deleting node is not allowed")
 		case errNoControlPlaneNodes, errLastControlPlaneNode:
-			klog.V(2).Infof("Deleting node %q is not allowed for machine %q: %v", m.Status.NodeRef.Name, m.Name, err)
+			logger.Error(err, "Deleting node is not allowed", "node", m.Status.NodeRef.Name)
 		default:
-			klog.Errorf("IsDeleteNodeAllowed check failed for machine %q: %v", m.Name, err)
+			logger.Error(err, "IsDeleteNodeAllowed check failed")
 			return ctrl.Result{}, err
 		}
 	} else {
-		klog.Infof("Deleting node %q for machine %q", m.Status.NodeRef.Name, m.Name)
+		// Drain node before deletion
+		if _, exists := m.ObjectMeta.Annotations[clusterv1.ExcludeNodeDrainingAnnotation]; !exists {
+			logger.Info("Draining node", "node", m.Status.NodeRef.Name)
+			if err := r.drainNode(cluster, m.Status.NodeRef.Name, m.Name); err != nil {
+				r.recorder.Eventf(m, corev1.EventTypeWarning, "FailedDrainNode", "error draining Machine's node %q: %v", m.Status.NodeRef.Name, err)
+				return ctrl.Result{}, err
+			}
+			r.recorder.Eventf(m, corev1.EventTypeNormal, "SuccessfulDrainNode", "success draining Machine's node %q", m.Status.NodeRef.Name)
+		}
+		logger.Info("Deleting node", "node", m.Status.NodeRef.Name)
 
 		var deleteNodeErr error
 		waitErr := wait.PollImmediate(2*time.Second, 10*time.Second, func() (bool, error) {
@@ -194,8 +241,7 @@ func (r *MachineReconciler) reconcileDelete(ctx context.Context, cluster *cluste
 			return true, nil
 		})
 		if waitErr != nil {
-			// TODO: remove m.Name after #1203
-			r.Log.Error(deleteNodeErr, "timed out deleting Machine's node, moving on", "node", m.Status.NodeRef.Name, "machine", m.Name)
+			logger.Error(deleteNodeErr, "Timed out deleting node, moving on", "node", m.Status.NodeRef.Name)
 			r.recorder.Eventf(m, corev1.EventTypeWarning, "FailedDeleteNode", "error deleting Machine's node: %v", deleteNodeErr)
 		}
 	}
@@ -219,7 +265,7 @@ func (r *MachineReconciler) isDeleteNodeAllowed(ctx context.Context, machine *cl
 	}
 
 	// Get all of the machines that belong to this cluster.
-	machines, err := getActiveMachinesInCluster(ctx, r.Client, machine.Namespace, machine.Labels[clusterv1.MachineClusterLabelName])
+	machines, err := getActiveMachinesInCluster(ctx, r.Client, machine.Namespace, machine.Labels[clusterv1.ClusterLabelName])
 	if err != nil {
 		return err
 	}
@@ -242,32 +288,97 @@ func (r *MachineReconciler) isDeleteNodeAllowed(ctx context.Context, machine *cl
 	}
 }
 
-func (r *MachineReconciler) deleteNode(ctx context.Context, cluster *clusterv1.Cluster, name string) error {
+func (r *MachineReconciler) drainNode(cluster *clusterv1.Cluster, nodeName string, machineName string) error {
+	logger := r.Log.WithValues("machine", machineName, "node", nodeName, "cluster", cluster.Name, "namespace", cluster.Namespace)
+	var kubeClient kubernetes.Interface
 	if cluster == nil {
-		// Try to retrieve the Node from the local cluster, if no Cluster reference is found.
-		var node corev1.Node
-		if err := r.Client.Get(ctx, client.ObjectKey{Name: name}, &node); err != nil {
-			return err
+		var err error
+		kubeClient, err = kubernetes.NewForConfig(r.config)
+		if err != nil {
+			return errors.Errorf("unable to build kube client: %v", err)
 		}
-		return r.Client.Delete(ctx, &node)
+	} else {
+		// Otherwise, proceed to get the remote cluster client and get the Node.
+		restConfig, err := remote.RESTConfig(r.Client, cluster)
+		if err != nil {
+			logger.Error(err, "Error creating a remote client while deleting Machine, won't retry")
+			return nil
+		}
+		kubeClient, err = kubernetes.NewForConfig(restConfig)
+		if err != nil {
+			logger.Error(err, "Error creating a remote client while deleting Machine, won't retry")
+			return nil
+		}
 	}
 
-	// Otherwise, proceed to get the remote cluster client and get the Node.
-	remoteClient, err := remote.NewClusterClient(r.Client, cluster)
+	node, err := kubeClient.CoreV1().Nodes().Get(nodeName, metav1.GetOptions{})
 	if err != nil {
-		klog.Errorf("Error creating a remote client for cluster %q while deleting Machine %q, won't retry: %v",
-			cluster.Name, name, err)
+		if apierrors.IsNotFound(err) {
+			// If an admin deletes the node directly, we'll end up here.
+			logger.Error(err, "Could not find node from noderef, it may have already been deleted")
+			return nil
+		}
+		return errors.Errorf("unable to get node %q: %v", nodeName, err)
+	}
+
+	drainer := &kubedrain.Helper{
+		Client:              kubeClient,
+		Force:               true,
+		IgnoreAllDaemonSets: true,
+		DeleteLocalData:     true,
+		GracePeriodSeconds:  -1,
+		// If a pod is not evicted in 20 seconds, retry the eviction next time the
+		// machine gets reconciled again (to allow other machines to be reconciled).
+		Timeout: 20 * time.Second,
+		OnPodDeletedOrEvicted: func(pod *corev1.Pod, usingEviction bool) {
+			verbStr := "Deleted"
+			if usingEviction {
+				verbStr = "Evicted"
+			}
+			logger.Info(fmt.Sprintf("%s pod from Node", verbStr),
+				"pod", fmt.Sprintf("%s/%s", pod.Name, pod.Namespace))
+		},
+		Out:    writer{klog.Info},
+		ErrOut: writer{klog.Error},
+		DryRun: false,
+	}
+
+	if err := kubedrain.RunCordonOrUncordon(drainer, node, true); err != nil {
+		// Machine will be re-reconciled after a cordon failure.
+		logger.Error(err, "Cordon failed")
+		return errors.Errorf("unable to cordon node %s: %v", node.Name, err)
+	}
+
+	if err := kubedrain.RunNodeDrain(drainer, node.Name); err != nil {
+		// Machine will be re-reconciled after a drain failure.
+		logger.Error(err, "Drain failed")
+		return &capierrors.RequeueAfterError{RequeueAfter: 20 * time.Second}
+	}
+
+	logger.Info("Drain successful")
+	return nil
+}
+
+func (r *MachineReconciler) deleteNode(ctx context.Context, cluster *clusterv1.Cluster, name string) error {
+	logger := r.Log.WithValues("machine", name, "cluster", cluster.Name, "namespace", cluster.Namespace)
+
+	// Create a remote client to delete the node
+	c, err := remote.NewClusterClient(r.Client, cluster, r.scheme)
+	if err != nil {
+		logger.Error(err, "Error creating a remote client for cluster while deleting Machine, won't retry")
 		return nil
 	}
 
-	corev1Remote, err := remoteClient.CoreV1()
-	if err != nil {
-		klog.Errorf("Error creating a remote client for cluster %q while deleting Machine %q, won't retry: %v",
-			cluster.Name, name, err)
-		return nil
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
 	}
 
-	return corev1Remote.Nodes().Delete(name, &metav1.DeleteOptions{})
+	if err := c.Delete(ctx, node); err != nil {
+		return errors.Wrapf(err, "error deleting node %s", name)
+	}
+	return nil
 }
 
 // reconcileDeleteExternal tries to delete external references, returning true if it cannot find any.
@@ -284,8 +395,8 @@ func (r *MachineReconciler) reconcileDeleteExternal(ctx context.Context, m *clus
 			continue
 		}
 
-		obj, err := external.Get(r.Client, ref, m.Namespace)
-		if err != nil && !apierrors.IsNotFound(err) {
+		obj, err := external.Get(ctx, r.Client, ref, m.Namespace)
+		if err != nil && !apierrors.IsNotFound(errors.Cause(err)) {
 			return false, errors.Wrapf(err, "failed to get %s %q for Machine %q in namespace %q",
 				ref.GroupVersionKind(), ref.Name, m.Name, m.Namespace)
 		}
@@ -309,4 +420,15 @@ func (r *MachineReconciler) reconcileDeleteExternal(ctx context.Context, m *clus
 
 func (r *MachineReconciler) shouldAdopt(m *clusterv1.Machine) bool {
 	return !util.HasOwner(m.OwnerReferences, clusterv1.GroupVersion.String(), []string{"MachineSet", "Cluster"})
+}
+
+// writer implements io.Writer interface as a pass-through for klog.
+type writer struct {
+	logFunc func(args ...interface{})
+}
+
+// Write passes string(p) into writer's logFunc and always returns len(p)
+func (w writer) Write(p []byte) (n int, err error) {
+	w.logFunc(string(p))
+	return len(p), nil
 }
